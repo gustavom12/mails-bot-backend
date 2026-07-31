@@ -15,6 +15,11 @@ interface Attachment {
   contentType: string;
   s3Key: string;
   size: number;
+  // ID del adjunto en el proveedor (Aurinko), usado para descargarlo on-demand.
+  attachmentId?: string;
+  // Adjuntos inline (imágenes embebidas en el cuerpo vía cid:) vs. archivos reales.
+  inline?: boolean;
+  contentId?: string;
 }
 
 @Schema({ timestamps: true, collection: 'messages' })

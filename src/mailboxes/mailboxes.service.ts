@@ -2,39 +2,20 @@ import {
   Injectable,
   NotFoundException,
   ConflictException,
-  BadRequestException,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
 import { Mailbox, MailboxDocument } from './schemas/mailbox.schema';
-import { Hotel, HotelDocument } from '../hotels/schemas/hotel.schema';
 import { CreateMailboxSchema, CreateMailboxDto } from './dto/create-mailbox.dto';
 
 @Injectable()
 export class MailboxesService {
   constructor(
     @InjectModel(Mailbox.name) private readonly mailboxModel: Model<MailboxDocument>,
-    @InjectModel(Hotel.name) private readonly hotelModel: Model<HotelDocument>,
   ) {}
 
   async create(tenantId: string, dto: CreateMailboxDto): Promise<MailboxDocument> {
     CreateMailboxSchema.parse(dto);
-
-    // Verificar que el hotel pertenece al tenant
-    const hotel = await this.hotelModel.findOne({
-      _id: new Types.ObjectId(dto.hotelId),
-      tenantId: new Types.ObjectId(tenantId),
-      active: true,
-    });
-    if (!hotel) throw new BadRequestException('Hotel no encontrado o inactivo');
-
-    // Regla 1 hotel = 1 casilla
-    const existingForHotel = await this.mailboxModel.findOne({
-      hotelId: new Types.ObjectId(dto.hotelId),
-    });
-    if (existingForHotel) {
-      throw new ConflictException('Este hotel ya tiene una casilla asignada');
-    }
 
     // Email único dentro del tenant
     const existingEmail = await this.mailboxModel.findOne({
@@ -47,7 +28,6 @@ export class MailboxesService {
 
     return this.mailboxModel.create({
       tenantId: new Types.ObjectId(tenantId),
-      hotelId: new Types.ObjectId(dto.hotelId),
       email: dto.email.toLowerCase(),
       status: 'pending',
       active: true,
@@ -57,7 +37,6 @@ export class MailboxesService {
   async findAll(tenantId: string): Promise<MailboxDocument[]> {
     return this.mailboxModel
       .find({ tenantId: new Types.ObjectId(tenantId), active: true })
-      .populate('hotelId', 'name')
       .sort({ createdAt: -1 })
       .exec();
   }
@@ -68,20 +47,10 @@ export class MailboxesService {
         _id: new Types.ObjectId(mailboxId),
         tenantId: new Types.ObjectId(tenantId),
       })
-      .populate('hotelId', 'name')
       .exec();
 
     if (!mailbox) throw new NotFoundException('Casilla no encontrada');
     return mailbox;
-  }
-
-  async findByHotel(tenantId: string, hotelId: string): Promise<MailboxDocument | null> {
-    return this.mailboxModel
-      .findOne({
-        hotelId: new Types.ObjectId(hotelId),
-        tenantId: new Types.ObjectId(tenantId),
-      })
-      .exec();
   }
 
   async deactivate(tenantId: string, mailboxId: string): Promise<MailboxDocument> {

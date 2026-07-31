@@ -16,6 +16,10 @@
     "test:cov": "jest --coverage",
     "seed": "ts-node -r tsconfig-paths/register src/scripts/seed.ts",
     "seed:templates": "ts-node -r tsconfig-paths/register src/scripts/seed-templates.ts",
+    "migrate:mailbox": "ts-node -r tsconfig-paths/register src/scripts/migrate-mailbox.ts",
+    "migrate:hotel-mailbox": "ts-node -r tsconfig-paths/register src/scripts/migrate-hotel-mailbox.ts",
+    "clone:db": "ts-node -r tsconfig-paths/register src/scripts/clone-db.ts",
+    "migrate:unread": "ts-node -r tsconfig-paths/register src/scripts/mark-unread.ts",
     "webhooks:register": "ts-node -r tsconfig-paths/register src/scripts/register-webhooks.ts",
     "webhooks:list": "ts-node -r tsconfig-paths/register src/scripts/list-webhooks.ts",
     "tunnel": "bash scripts/dev-tunnel.sh"

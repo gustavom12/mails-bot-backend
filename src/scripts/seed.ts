@@ -33,6 +33,7 @@ const UserSchema = new mongoose.Schema(
 const HotelSchema = new mongoose.Schema(
   {
     tenantId: mongoose.Schema.Types.ObjectId,
+    mailboxId: mongoose.Schema.Types.ObjectId,
     name: String,
     tone: String,
     signature: String,
@@ -46,7 +47,6 @@ const HotelSchema = new mongoose.Schema(
 const MailboxSchema = new mongoose.Schema(
   {
     tenantId: mongoose.Schema.Types.ObjectId,
-    hotelId: mongoose.Schema.Types.ObjectId,
     email: String,
     status: String,
     accessToken: String,
@@ -142,40 +142,44 @@ async function seed() {
 
   const tenantId = tenant._id;
 
-  // 2. Hotels
-  console.log('\n─── Hoteles ───────────────────────────────────');
-  const hotelIds: mongoose.Types.ObjectId[] = [];
-
-  for (const hotelData of HOTELS) {
-    let hotel = await HotelModel.findOne({ tenantId, name: hotelData.name });
-    if (!hotel) {
-      hotel = await HotelModel.create({ tenantId, ...hotelData, active: true });
-      console.log(`✅ Hotel creado: ${hotel.name} (${hotel._id})`);
-    } else {
-      console.log(`ℹ️  Hotel ya existe: ${hotel.name} (${hotel._id})`);
-    }
-    hotelIds.push(hotel._id as mongoose.Types.ObjectId);
-  }
-
-  // 3. Mailboxes
+  // 2. Mailboxes — se crean primero (varios hoteles pueden compartir una casilla)
   console.log('\n─── Casillas ──────────────────────────────────');
-  for (let i = 0; i < hotelIds.length; i++) {
+  const mailboxIds: mongoose.Types.ObjectId[] = [];
+  for (let i = 0; i < MAILBOX_EMAILS.length; i++) {
     const email = MAILBOX_EMAILS[i];
-    const hotelId = hotelIds[i];
 
     let mailbox = await MailboxModel.findOne({ tenantId, email });
     if (!mailbox) {
       mailbox = await MailboxModel.create({
         tenantId,
-        hotelId,
         email,
         status: 'pending',
         active: true,
       });
-      console.log(`✅ Casilla creada: ${mailbox.email} → Hotel[${i + 1}] (${mailbox._id})`);
+      console.log(`✅ Casilla creada: ${mailbox.email} (${mailbox._id})`);
     } else {
       console.log(`ℹ️  Casilla ya existe: ${mailbox.email}`);
     }
+    mailboxIds.push(mailbox._id as mongoose.Types.ObjectId);
+  }
+
+  // 3. Hotels — cada hotel se asocia a una casilla (mailboxId)
+  console.log('\n─── Hoteles ───────────────────────────────────');
+  const hotelIds: mongoose.Types.ObjectId[] = [];
+
+  for (let i = 0; i < HOTELS.length; i++) {
+    const hotelData = HOTELS[i];
+    const mailboxId = mailboxIds[i];
+
+    let hotel = await HotelModel.findOne({ tenantId, name: hotelData.name });
+    if (!hotel) {
+      hotel = await HotelModel.create({ tenantId, mailboxId, ...hotelData, active: true });
+      console.log(`✅ Hotel creado: ${hotel.name} → casilla[${i + 1}] (${hotel._id})`);
+    } else {
+      await HotelModel.updateOne({ _id: hotel._id }, { mailboxId });
+      console.log(`ℹ️  Hotel ya existe: ${hotel.name} (mailboxId actualizado)`);
+    }
+    hotelIds.push(hotel._id as mongoose.Types.ObjectId);
   }
 
   // 4. Users

@@ -1,6 +1,7 @@
 import { z } from 'zod';
 
 export const CreateHotelSchema = z.object({
+  mailboxId: z.string().min(1, 'La casilla es requerida'),
   name: z.string().min(2, 'El nombre debe tener al menos 2 caracteres').trim(),
   tone: z.string().trim().optional().default(''),
   signature: z.string().trim().optional().default(''),

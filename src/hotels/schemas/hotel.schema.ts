@@ -8,6 +8,11 @@ export class Hotel {
   @Prop({ required: true, type: Types.ObjectId, ref: 'Tenant', index: true })
   declare tenantId: Types.ObjectId;
 
+  // Casilla de correo asociada. Varios hoteles pueden compartir una misma casilla,
+  // pero cada hotel tiene una sola. Nullable en el schema para no romper hoteles legacy.
+  @Prop({ type: Types.ObjectId, ref: 'Mailbox', default: null, index: true })
+  declare mailboxId: Types.ObjectId | null;
+
   @Prop({ required: true, trim: true })
   declare name: string;
 

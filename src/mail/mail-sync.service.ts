@@ -107,7 +107,8 @@ export class MailSyncService {
       conversation = await this.conversationModel.create({
         tenantId,
         mailboxId,
-        hotelId: mailbox.hotelId,
+        // El hotel se asigna manualmente (una casilla puede servir a varios hoteles)
+        hotelId: null,
         stateId: defaultState!._id,
         internetMessageId: graphMsg.internetMessageId,
         graphConversationId: graphMsg.conversationId,

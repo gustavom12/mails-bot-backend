@@ -37,11 +37,21 @@ export interface AurinkoMessage {
   attachments: { id: string; name: string; mimeType: string; size: number; inline: boolean }[];
 }
 
+export interface AurinkoOutgoingAttachment {
+  name: string;
+  mimeType: string;
+  /** Contenido del archivo codificado en base64 */
+  content: string;
+  inline?: boolean;
+  contentId?: string;
+}
+
 export interface SendEmailDto {
   subject: string;
   body: string;
   to: AurinkoEmailAddress[];
   cc?: AurinkoEmailAddress[];
+  attachments?: AurinkoOutgoingAttachment[];
 }
 
 export type AurinkoServiceType = 'Google' | 'Office365' | 'EWS';
@@ -112,6 +122,9 @@ export class AurinkoService {
       params: {
         ...(pageToken ? { pageToken } : {}),
         pageSize: limit,
+        // Trae el cuerpo HTML completo (no solo el snippet) para conservar el
+        // formato real del email. Soportado por Google y Office365.
+        bodyType: 'html',
       },
     });
     return {
@@ -123,9 +136,29 @@ export class AurinkoService {
   async getMessageById(token: string, messageId: string): Promise<AurinkoMessage> {
     const { data } = await axios.get<AurinkoMessage>(
       `${AURINKO_BASE}/email/messages/${encodeURIComponent(messageId)}`,
-      { headers: this.headers(token) },
+      { headers: this.headers(token), params: { bodyType: 'html' } },
     );
     return data;
+  }
+
+  /**
+   * Descarga el contenido binario de un adjunto de un mensaje.
+   * Devuelve el buffer y el content-type reportado por Aurinko.
+   */
+  async getAttachment(
+    token: string,
+    messageId: string,
+    attachmentId: string,
+  ): Promise<{ content: Buffer; contentType: string }> {
+    const res = await axios.get<ArrayBuffer>(
+      `${AURINKO_BASE}/email/messages/${encodeURIComponent(messageId)}/attachments/${encodeURIComponent(attachmentId)}`,
+      { headers: this.headers(token), responseType: 'arraybuffer' },
+    );
+    return {
+      content: Buffer.from(res.data),
+      contentType:
+        (res.headers['content-type'] as string | undefined) ?? 'application/octet-stream',
+    };
   }
 
   async registerWebhook(token: string, notificationUrl: string): Promise<{ id: string; resource: string }> {
@@ -151,6 +184,17 @@ export class AurinkoService {
         body: dto.body,
         to: dto.to,
         ...(dto.cc?.length ? { cc: dto.cc } : {}),
+        ...(dto.attachments?.length
+          ? {
+              attachments: dto.attachments.map((a) => ({
+                name: a.name,
+                mimeType: a.mimeType,
+                content: a.content,
+                inline: a.inline ?? false,
+                ...(a.contentId ? { contentId: a.contentId } : {}),
+              })),
+            }
+          : {}),
       },
       {
         headers: { ...this.headers(token), 'Content-Type': 'application/json' },

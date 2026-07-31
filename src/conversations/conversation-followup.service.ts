@@ -5,13 +5,11 @@ import { ConfigService } from '@nestjs/config';
 import { Model, Types } from 'mongoose';
 import { Conversation, ConversationDocument } from './schemas/conversation.schema';
 import { Message, MessageDocument } from '../messages/schemas/message.schema';
-import { ConversationState, ConversationStateDocument } from '../conversation-states/schemas/conversation-state.schema';
+import {
+  ConversationState,
+  ConversationStateDocument,
+} from '../conversation-states/schemas/conversation-state.schema';
 import { ConversationsService } from './conversations.service';
-
-interface TenantStates {
-  followupState: ConversationStateDocument | null;
-  closedState: ConversationStateDocument | null;
-}
 
 @Injectable()
 export class ConversationFollowupService {
@@ -21,7 +19,8 @@ export class ConversationFollowupService {
   constructor(
     @InjectModel(Conversation.name) private readonly conversationModel: Model<ConversationDocument>,
     @InjectModel(Message.name) private readonly messageModel: Model<MessageDocument>,
-    @InjectModel(ConversationState.name) private readonly stateModel: Model<ConversationStateDocument>,
+    @InjectModel(ConversationState.name)
+    private readonly stateModel: Model<ConversationStateDocument>,
     private readonly conversationsService: ConversationsService,
     private readonly config: ConfigService,
   ) {}
@@ -45,55 +44,41 @@ export class ConversationFollowupService {
   }
 
   private async run(): Promise<void> {
-    const followupHours = Number(this.config.get<string>('FOLLOWUP_AFTER_HOURS') ?? '48');
-    const closeHours = Number(this.config.get<string>('CLOSE_AFTER_HOURS') ?? '120');
-    const followupStateName = this.config.get<string>('FOLLOWUP_STATE_NAME') ?? 'Esperando respuesta cliente';
+    const attentionDays = Number(this.config.get<string>('ATTENTION_AFTER_DAYS') ?? '5');
+    const attentionStateName =
+      this.config.get<string>('ATTENTION_STATE_NAME') ?? 'Requiere atención';
 
     const now = new Date();
-    const followupCutoff = new Date(now.getTime() - followupHours * 60 * 60 * 1000);
-    const closeCutoff = new Date(now.getTime() - closeHours * 60 * 60 * 1000);
+    const cutoff = new Date(now.getTime() - attentionDays * 24 * 60 * 60 * 1000);
 
     this.logger.log(
-      `Followup cron iniciado — followup >= ${followupHours}h (cutoff: ${followupCutoff.toISOString()}), cierre >= ${closeHours}h (cutoff: ${closeCutoff.toISOString()})`,
+      `Followup cron iniciado — "${attentionStateName}" >= ${attentionDays}d (cutoff: ${cutoff.toISOString()})`,
     );
 
-    // Cargar todos los estados activos y construir mapa por tenantId
-    const allStates = await this.stateModel.find({ active: true }).lean().exec();
-    const statesByTenant = new Map<string, TenantStates>();
-    const closedStateIds = new Set<string>();
+    // Cargar los estados "Requiere atención" activos y construir mapa por tenantId
+    const attentionStates = await this.stateModel
+      .find({ active: true, name: attentionStateName })
+      .lean()
+      .exec();
 
-    for (const state of allStates) {
+    const attentionStateByTenant = new Map<string, ConversationStateDocument>();
+    for (const state of attentionStates) {
       const tid = state.tenantId.toString();
-      if (!statesByTenant.has(tid)) {
-        statesByTenant.set(tid, { followupState: null, closedState: null });
-      }
-      const entry = statesByTenant.get(tid)!;
-
-      if (state.isClosed) {
-        closedStateIds.add((state._id as Types.ObjectId).toString());
-        // Tomar el primer estado cerrado encontrado por tenant
-        if (!entry.closedState) entry.closedState = state as unknown as ConversationStateDocument;
-      }
-      if (state.name === followupStateName) {
-        entry.followupState = state as unknown as ConversationStateDocument;
+      if (!attentionStateByTenant.has(tid)) {
+        attentionStateByTenant.set(tid, state as unknown as ConversationStateDocument);
       }
     }
 
-    // Buscar conversaciones no cerradas cuyo lastActivityAt superó el umbral de followup
-    const closedIdObjects = [...closedStateIds].map((id) => new Types.ObjectId(id));
+    // Buscar conversaciones cuyo lastActivityAt superó el umbral de inactividad
     const candidates = await this.conversationModel
-      .find({
-        lastActivityAt: { $lt: followupCutoff },
-        ...(closedIdObjects.length ? { stateId: { $nin: closedIdObjects } } : {}),
-      })
+      .find({ lastActivityAt: { $lt: cutoff } })
       .select('_id tenantId stateId lastActivityAt')
       .lean()
       .exec();
 
     this.logger.log(`Conversaciones candidatas: ${candidates.length}`);
 
-    let followuped = 0;
-    let closed = 0;
+    let updated = 0;
     let skipped = 0;
 
     for (const conv of candidates) {
@@ -113,66 +98,38 @@ export class ConversationFollowupService {
         continue;
       }
 
-      const tenantStates = statesByTenant.get(tenantId);
-      if (!tenantStates) {
-        this.logger.warn(`Tenant ${tenantId} sin estados configurados — saltando conv ${conversationId}`);
+      const attentionState = attentionStateByTenant.get(tenantId);
+      if (!attentionState) {
+        this.logger.warn(
+          `Tenant ${tenantId} sin estado "${attentionStateName}" — saltando conv ${conversationId}`,
+        );
         skipped++;
         continue;
       }
 
+      const attentionId = (attentionState._id as Types.ObjectId).toString();
       const currentStateId = (conv.stateId as Types.ObjectId).toString();
-      const age = now.getTime() - new Date(conv.lastActivityAt).getTime();
-      const ageHours = age / (60 * 60 * 1000);
-
-      if (ageHours >= closeHours) {
-        // Debe cerrarse
-        const { closedState } = tenantStates;
-        if (!closedState) {
-          this.logger.warn(`Tenant ${tenantId} sin estado cerrado — saltando conv ${conversationId}`);
-          skipped++;
-          continue;
-        }
-        const closedId = (closedState._id as Types.ObjectId).toString();
-        if (currentStateId === closedId) {
-          skipped++;
-          continue;
-        }
-        await this.conversationsService.changeStateSystem(
-          conversationId,
-          closedId,
-          closedState.name,
-          'auto: cierre por inactividad del cliente',
-        );
-        closed++;
-        this.logger.debug(`Conv ${conversationId} cerrada (${ageHours.toFixed(1)}h sin respuesta)`);
-      } else {
-        // Debe pasar a seguimiento
-        const { followupState } = tenantStates;
-        if (!followupState) {
-          this.logger.warn(
-            `Tenant ${tenantId} sin estado "${followupStateName}" — saltando conv ${conversationId}`,
-          );
-          skipped++;
-          continue;
-        }
-        const followupId = (followupState._id as Types.ObjectId).toString();
-        if (currentStateId === followupId) {
-          skipped++;
-          continue;
-        }
-        await this.conversationsService.changeStateSystem(
-          conversationId,
-          followupId,
-          followupState.name,
-          'auto: sin respuesta del cliente',
-        );
-        followuped++;
-        this.logger.debug(`Conv ${conversationId} marcada en seguimiento (${ageHours.toFixed(1)}h sin respuesta)`);
+      if (currentStateId === attentionId) {
+        skipped++;
+        continue;
       }
+
+      const ageDays =
+        (now.getTime() - new Date(conv.lastActivityAt).getTime()) / (24 * 60 * 60 * 1000);
+      await this.conversationsService.changeStateSystem(
+        conversationId,
+        attentionId,
+        attentionState.name,
+        'auto: sin respuesta del cliente',
+      );
+      updated++;
+      this.logger.debug(
+        `Conv ${conversationId} marcada como "${attentionStateName}" (${ageDays.toFixed(1)}d sin respuesta)`,
+      );
     }
 
     this.logger.log(
-      `Followup cron completado — seguimiento: ${followuped}, cerradas: ${closed}, saltadas: ${skipped}`,
+      `Followup cron completado — "${attentionStateName}": ${updated}, saltadas: ${skipped}`,
     );
   }
 }

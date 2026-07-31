@@ -39,6 +39,22 @@ export class AurinkoSyncService {
   }
 
   /**
+   * Mapea los adjuntos de un mensaje de Aurinko al formato persistido.
+   * Guardamos el `attachmentId` del proveedor para poder descargarlos on-demand
+   * (no almacenamos el binario en Mongo).
+   */
+  private mapAttachments(msg: AurinkoMessage) {
+    return (msg.attachments ?? []).map((a) => ({
+      name: a.name || 'adjunto',
+      contentType: a.mimeType || 'application/octet-stream',
+      s3Key: '',
+      size: a.size ?? 0,
+      attachmentId: a.id,
+      inline: a.inline ?? false,
+    }));
+  }
+
+  /**
    * Sincroniza un mensaje específico por su ID de Aurinko.
    * Usado por el webhook cuando llega un evento `created`.
    */
@@ -81,7 +97,8 @@ export class AurinkoSyncService {
       conversation = await this.conversationModel.create({
         tenantId: new Types.ObjectId(tenantId),
         mailboxId: mailbox._id,
-        hotelId: mailbox.hotelId,
+        // El hotel se asigna manualmente (una casilla puede servir a varios hoteles)
+        hotelId: null,
         stateId: defaultState._id,
         internetMessageId: msg.internetMessageId,
         graphConversationId: msg.threadId,
@@ -91,13 +108,17 @@ export class AurinkoSyncService {
         contactEmail: msg.from?.address ?? '',
         contactName: msg.from?.name ?? null,
         statusHistory: [],
+        lastMessageDirection: 'inbound',
       });
     } else {
       const msgDate = new Date(msg.receivedAt ?? msg.sentAt ?? Date.now());
-      if (msgDate > conversation.lastActivityAt) {
+      if (msgDate >= conversation.lastActivityAt) {
         conversation.lastActivityAt = msgDate;
-        await conversation.save();
+        conversation.lastMessageDirection = isOutbound ? 'outbound' : 'inbound';
       }
+      // Nuevo mensaje del cliente → vuelve a marcarse como no leída
+      if (!isOutbound) conversation.unread = true;
+      await conversation.save();
     }
 
     const bodyRaw = msg.body ?? msg.bodySnippet ?? '';
@@ -117,12 +138,13 @@ export class AurinkoSyncService {
       bodyPreview: msg.bodySnippet ?? '',
       direction: isOutbound ? 'outbound' : 'inbound',
       receivedAt: new Date(msg.receivedAt ?? msg.sentAt ?? Date.now()),
-      attachments: [],
+      attachments: this.mapAttachments(msg),
       approvedBy: null,
     });
 
-    // Disparar triage IA de forma asíncrona solo para mensajes inbound
-    if (!isOutbound) {
+    // Disparar triage IA solo para inbound y si la conversación ya tiene hotel asignado.
+    // Si no tiene hotel, la IA se dispara al asignarlo manualmente.
+    if (!isOutbound && conversation.hotelId) {
       void this.aiTriageService.processInbound(
         (conversation._id as import('mongoose').Types.ObjectId).toString(),
         tenantId,
@@ -210,7 +232,8 @@ export class AurinkoSyncService {
           conversation = await this.conversationModel.create({
             tenantId: new Types.ObjectId(tenantId),
             mailboxId: mailbox._id,
-            hotelId: mailbox.hotelId,
+            // El hotel se asigna manualmente (una casilla puede servir a varios hoteles)
+            hotelId: null,
             stateId: defaultState._id,
             internetMessageId: msg.internetMessageId,
             graphConversationId: msg.threadId,
@@ -220,14 +243,18 @@ export class AurinkoSyncService {
             contactEmail: msg.from?.address ?? '',
             contactName: msg.from?.name ?? null,
             statusHistory: [],
+            lastMessageDirection: 'inbound',
           });
         } else {
-          // Actualizar lastActivityAt si el mensaje es más nuevo
+          // Actualizar lastActivityAt y dirección si el mensaje es más nuevo
           const msgDate = new Date(msg.receivedAt ?? msg.date ?? Date.now());
-          if (msgDate > conversation.lastActivityAt) {
+          if (msgDate >= conversation.lastActivityAt) {
             conversation.lastActivityAt = msgDate;
-            await conversation.save();
+            conversation.lastMessageDirection = isOutbound ? 'outbound' : 'inbound';
           }
+          // Nuevo mensaje del cliente → vuelve a marcarse como no leída
+          if (!isOutbound) conversation.unread = true;
+          await conversation.save();
         }
 
         // Crear mensaje
@@ -249,12 +276,13 @@ export class AurinkoSyncService {
           bodyPreview: msg.bodySnippet ?? '',
           direction,
           receivedAt,
-          attachments: [],
+          attachments: this.mapAttachments(msg),
           approvedBy: null,
         });
 
-        // Disparar triage IA de forma asíncrona para nuevos mensajes inbound
-        if (!isOutbound) {
+        // Disparar triage IA solo para inbound y si la conversación ya tiene hotel asignado.
+        // Si no tiene hotel, la IA se dispara al asignarlo manualmente.
+        if (!isOutbound && conversation.hotelId) {
           void this.aiTriageService.processInbound(
             (conversation._id as import('mongoose').Types.ObjectId).toString(),
             tenantId,

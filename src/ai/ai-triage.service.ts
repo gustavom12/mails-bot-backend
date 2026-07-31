@@ -69,6 +69,12 @@ export class AiTriageService {
 
     const emailText = `${message.subject ?? ''}\n\n${message.bodyPreview ?? ''}`.trim();
 
+    // Sin hotel asignado no hay contexto para la IA: se procesará al asignarlo manualmente.
+    if (!conversation.hotelId) {
+      this.logger.debug(`Triage IA: conversación sin hotel asignado [conv=${conversationId}], se omite`);
+      return;
+    }
+
     // --- 2. Cargar contexto del hotel ---
     const hotel = await this.hotelModel.findById(conversation.hotelId);
     if (!hotel) {
@@ -207,7 +213,6 @@ export class AiTriageService {
 INFORMACIÓN DEL HOTEL:
 - Tono de comunicación: ${hotel.tone || 'Profesional y amable'}
 - Información de marca: ${hotel.brandInfo || 'Hotel de servicio premium'}
-- Firma: ${hotel.signature || ''}
 - Reglas especiales: ${hotel.aiRules?.length ? hotel.aiRules.join('; ') : 'Ninguna'}
 
 COLUMNAS DISPONIBLES EN EL KANBAN (debes elegir exactamente una, usando su nombre EXACTO):
@@ -218,7 +223,7 @@ INSTRUCCIONES:
 2. IMPORTANTE: Como estás procesando el email y preparando una respuesta, NUNCA lo dejes en la columna inicial "${defaultStateName}" (esa columna es solo para mensajes sin procesar). Elegí la columna que refleje que ya hay una respuesta lista para revisar/enviar (por ejemplo, una columna del tipo "Respuesta preparada"), salvo que el caso requiera atención especial.
 3. Para la respuesta: si alguno de los TEMPLATES DISPONIBLES aplica al email (aunque sea parcialmente), DEBES usarlo. Devuelve source="template" y su templateId exacto, adaptando el contenido al email si hace falta. Solo usá source="generated" si NINGÚN template aplica; en ese caso, basate en las conversaciones previas similares y en el tono del hotel.
 4. La respuesta debe estar en el mismo idioma que el email entrante.
-5. Incluye la firma del hotel si se proporcionó.
+5. NO incluyas ninguna firma ni despedida firmada al final: la firma del hotel se agrega automáticamente al responder, así que evitá duplicarla.
 6. Sé conciso y profesional.
 
 Responde ÚNICAMENTE con un objeto JSON con esta estructura exacta:

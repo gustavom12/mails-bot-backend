@@ -1,13 +1,35 @@
-import { Injectable, NotFoundException, ConflictException } from '@nestjs/common';
+import {
+  Injectable,
+  NotFoundException,
+  ConflictException,
+  BadRequestException,
+} from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
 import { Hotel, HotelDocument } from './schemas/hotel.schema';
+import { Mailbox, MailboxDocument } from '../mailboxes/schemas/mailbox.schema';
 import { CreateHotelSchema, CreateHotelDto } from './dto/create-hotel.dto';
 import { UpdateHotelSchema, UpdateHotelDto } from './dto/update-hotel.dto';
 
 @Injectable()
 export class HotelsService {
-  constructor(@InjectModel(Hotel.name) private readonly hotelModel: Model<HotelDocument>) {}
+  constructor(
+    @InjectModel(Hotel.name) private readonly hotelModel: Model<HotelDocument>,
+    @InjectModel(Mailbox.name) private readonly mailboxModel: Model<MailboxDocument>,
+  ) {}
+
+  /**
+   * Verifica que la casilla exista y pertenezca al tenant. Devuelve su ObjectId.
+   */
+  private async validateMailbox(tenantId: string, mailboxId: string): Promise<Types.ObjectId> {
+    const mailbox = await this.mailboxModel.findOne({
+      _id: new Types.ObjectId(mailboxId),
+      tenantId: new Types.ObjectId(tenantId),
+      active: true,
+    });
+    if (!mailbox) throw new BadRequestException('Casilla no encontrada o inactiva');
+    return mailbox._id as Types.ObjectId;
+  }
 
   async create(tenantId: string, dto: CreateHotelDto): Promise<HotelDocument> {
     CreateHotelSchema.parse(dto);
@@ -18,8 +40,11 @@ export class HotelsService {
     });
     if (exists) throw new ConflictException('Ya existe un hotel con ese nombre en este tenant');
 
+    const mailboxId = await this.validateMailbox(tenantId, dto.mailboxId);
+
     return this.hotelModel.create({
       tenantId: new Types.ObjectId(tenantId),
+      mailboxId,
       name: dto.name,
       tone: dto.tone ?? '',
       signature: dto.signature ?? '',
@@ -57,6 +82,9 @@ export class HotelsService {
     });
     if (!hotel) throw new NotFoundException('Hotel no encontrado');
 
+    if (dto.mailboxId !== undefined) {
+      hotel.mailboxId = await this.validateMailbox(tenantId, dto.mailboxId);
+    }
     if (dto.name !== undefined) hotel.name = dto.name;
     if (dto.tone !== undefined) hotel.tone = dto.tone;
     if (dto.signature !== undefined) hotel.signature = dto.signature;

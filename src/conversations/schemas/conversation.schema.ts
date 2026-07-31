@@ -19,8 +19,10 @@ export class Conversation {
   @Prop({ required: true, type: Types.ObjectId, ref: 'Mailbox', index: true })
   declare mailboxId: Types.ObjectId;
 
-  @Prop({ required: true, type: Types.ObjectId, ref: 'Hotel' })
-  declare hotelId: Types.ObjectId;
+  // Hotel al que pertenece la conversacion. Puede quedar null hasta que el staff
+  // lo asigne manualmente (una casilla puede servir a varios hoteles).
+  @Prop({ type: Types.ObjectId, ref: 'Hotel', default: null })
+  declare hotelId: Types.ObjectId | null;
 
   @Prop({ required: true, type: Types.ObjectId, ref: 'ConversationState' })
   declare stateId: Types.ObjectId;
@@ -46,6 +48,15 @@ export class Conversation {
 
   @Prop({ type: String, default: null })
   declare contactName: string | null;
+
+  // Marca de lectura: true = no leída (mensaje nuevo de cliente sin ver por un admin)
+  @Prop({ type: Boolean, default: true })
+  declare unread: boolean;
+
+  // Dirección del último mensaje: 'inbound' = falta responder al cliente,
+  // 'outbound' = ya respondimos y esperamos respuesta del cliente.
+  @Prop({ type: String, enum: ['inbound', 'outbound'], default: 'inbound' })
+  declare lastMessageDirection: 'inbound' | 'outbound';
 
   @Prop({
     type: [
@@ -81,6 +92,8 @@ export const ConversationSchema = SchemaFactory.createForClass(Conversation);
 
 ConversationSchema.index({ tenantId: 1, createdAt: -1 });
 ConversationSchema.index({ tenantId: 1, mailboxId: 1, stateId: 1 });
+ConversationSchema.index({ tenantId: 1, hotelId: 1 });
 ConversationSchema.index({ tenantId: 1, stateId: 1, lastActivityAt: -1 });
 ConversationSchema.index({ internetMessageId: 1 }, { unique: true });
 ConversationSchema.index({ tenantId: 1, contactEmail: 1 });
+ConversationSchema.index({ tenantId: 1, unread: 1 });

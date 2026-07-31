@@ -10,9 +10,6 @@ export class Mailbox {
   @Prop({ required: true, type: Types.ObjectId, ref: 'Tenant', index: true })
   declare tenantId: Types.ObjectId;
 
-  @Prop({ required: true, type: Types.ObjectId, ref: 'Hotel', unique: true })
-  declare hotelId: Types.ObjectId;
-
   @Prop({ required: true, trim: true, lowercase: true })
   declare email: string;
 
