@@ -15,13 +15,7 @@ async function bootstrap() {
   app.use(cookieParser());
   app.setGlobalPrefix('api');
 
-  const isDev = process.env.NODE_ENV !== 'production';
-  app.enableCors({
-    origin: isDev
-      ? (origin, callback) => callback(null, true) // allow all origins in dev
-      : process.env.FRONTEND_URL,
-    credentials: true,
-  });
+  app.enableCors();
   app.useGlobalFilters(new AllExceptionsFilter());
 
   const port = process.env.PORT ?? 3001;
