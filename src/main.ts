@@ -15,7 +15,10 @@ async function bootstrap() {
   app.use(cookieParser());
   app.setGlobalPrefix('api');
 
-  app.enableCors();
+  app.enableCors({
+    origin: true, // refleja cualquier Origin (compatible con credentials)
+    credentials: true,
+  });
   app.useGlobalFilters(new AllExceptionsFilter());
 
   const port = process.env.PORT ?? 3001;

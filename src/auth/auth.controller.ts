@@ -11,6 +11,18 @@ interface RequestWithUser extends Request {
   user: UserDocument;
 }
 
+/** Cross-origin (Vercel → Railway) requires SameSite=None + Secure in production. */
+function cookieOptions() {
+  const isProd = process.env.NODE_ENV === 'production';
+  return {
+    httpOnly: true,
+    secure: isProd,
+    sameSite: (isProd ? 'none' : 'lax') as 'none' | 'lax',
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+    path: '/',
+  };
+}
+
 @Controller('auth')
 export class AuthController {
   constructor(private readonly authService: AuthService) {}
@@ -28,12 +40,7 @@ export class AuthController {
 
     const { access_token } = this.authService.login(req.user);
 
-    res.cookie('access_token', access_token, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 7 * 24 * 60 * 60 * 1000,
-    });
+    res.cookie('access_token', access_token, cookieOptions());
 
     return { message: 'Sesión iniciada', user: this.authService.getProfile(req.user) };
   }
@@ -48,7 +55,7 @@ export class AuthController {
   @Post('logout')
   @HttpCode(200)
   logout(@Res({ passthrough: true }) res: Response) {
-    res.clearCookie('access_token');
+    res.clearCookie('access_token', cookieOptions());
     return { message: 'Sesión cerrada' };
   }
 }
