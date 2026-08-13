@@ -21,6 +21,7 @@
     "clone:db": "ts-node -r tsconfig-paths/register src/scripts/clone-db.ts",
     "migrate:unread": "ts-node -r tsconfig-paths/register src/scripts/mark-unread.ts",
     "webhooks:register": "ts-node -r tsconfig-paths/register src/scripts/register-webhooks.ts",
+    "internals:check": "ts-node -r tsconfig-paths/register src/scripts/check-internals.ts",
     "webhooks:list": "ts-node -r tsconfig-paths/register src/scripts/list-webhooks.ts",
     "tunnel": "bash scripts/dev-tunnel.sh"
   },

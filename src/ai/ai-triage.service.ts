@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
 import { Conversation, ConversationDocument } from '../conversations/schemas/conversation.schema';
@@ -16,6 +17,53 @@ interface TriageResult {
   summary?: string;
 }
 
+export interface InternalCheckResult {
+  internal: boolean;
+  confidence: number;
+  category?: string;
+  reason?: string;
+}
+
+/**
+ * Prompts del clasificador de mails internos. Exportados para que el script
+ * de diagnóstico (src/scripts/check-internals.ts) use exactamente los mismos.
+ */
+export function buildInternalCheckSystemPrompt(): string {
+  return `Sos un clasificador de emails entrantes para la casilla de correo de un hotel. Tu ÚNICA tarea es decidir si el email es un correo interno/automático que NO requiere ninguna respuesta ni acción de una persona.
+
+SON INTERNOS (internal=true) SOLO los correos 100% automáticos sin acción pendiente:
+- Notificaciones transaccionales de sistemas (confirmaciones de entrega de emails, digests automáticos, reportes programados)
+- Newsletters y correos promocionales / de marketing
+- Spam
+- Alertas automáticas de plataformas y correos de remitentes no-reply que son puramente informativos
+
+NO SON INTERNOS (internal=false) — cualquier correo donde una persona podría esperar lectura, respuesta o acción:
+- Consultas, reservas, quejas o mensajes de huéspedes/clientes (aunque los haya generado un formulario)
+- Notificaciones de reservas de OTAs (Booking, Expedia, etc.) que pueden requerir acción del hotel
+- Facturas o cobros que deben pagarse o revisarse
+- Cualquier correo escrito por una persona
+
+REGLAS ESTRICTAS:
+1. Ante la MÁS MÍNIMA duda, internal=false. Solo internal=true si estás totalmente seguro de que nadie necesita leerlo ni responderlo.
+2. "confidence" (0 a 1) es tu certeza de que NO requiere ninguna atención humana.
+
+Respondé ÚNICAMENTE con un objeto JSON:
+{"internal": true|false, "confidence": 0.0, "category": "transactional"|"promotional"|"spam"|"system"|"other", "reason": "explicación de 1 línea"}`;
+}
+
+export function buildInternalCheckUserPrompt(email: {
+  fromName?: string | null;
+  fromAddress?: string | null;
+  subject?: string | null;
+  bodyPreview?: string | null;
+}): string {
+  return `EMAIL ENTRANTE:
+Remitente: ${email.fromName ?? ''} <${email.fromAddress ?? ''}>
+Asunto: ${email.subject ?? '(sin asunto)'}
+Contenido (preview):
+${(email.bodyPreview ?? '').slice(0, 800)}`;
+}
+
 @Injectable()
 export class AiTriageService {
   private readonly logger = new Logger(AiTriageService.name);
@@ -27,7 +75,128 @@ export class AiTriageService {
     @InjectModel(ConversationState.name) private readonly stateModel: Model<ConversationStateDocument>,
     private readonly templatesService: TemplatesService,
     private readonly openAiService: OpenAiService,
+    private readonly config: ConfigService,
   ) {}
+
+  /**
+   * Punto de entrada para mails entrantes desde el sync/webhook.
+   * Primero evalúa si el mail es 100% interno (transaccional, promocional,
+   * spam, etc.) y en ese caso lo manda a la columna "Internos" leído y sin
+   * pedir atención. Ante la mínima duda, sigue el flujo normal de triage.
+   */
+  async triageInbound(
+    conversationId: string,
+    tenantId: string,
+    messageId: string,
+    opts: { newConversation?: boolean } = {},
+  ): Promise<void> {
+    try {
+      const routedToInternal = await this._routeInternalIfCertain(
+        conversationId,
+        tenantId,
+        messageId,
+        opts.newConversation ?? false,
+      );
+      if (routedToInternal) return;
+    } catch (err) {
+      this.logger.error(`Error en clasificación de internos [conv=${conversationId}]:`, err);
+    }
+
+    await this.processInbound(conversationId, tenantId, messageId);
+  }
+
+  /**
+   * Clasifica el mail como interno SOLO si la IA está totalmente segura de que
+   * no requiere respuesta ni acción humana. Devuelve true si lo enrutó.
+   *
+   * - Requiere que exista un estado activo con nombre INTERNAL_STATE_NAME
+   *   (default "Internos") en el tenant; si no existe, no hace nada.
+   * - Solo clasifica conversaciones nuevas: un hilo con historial humano nunca
+   *   se archiva solo. Los mensajes siguientes de un hilo ya interno se
+   *   mantienen leídos y en la misma columna, sin volver a llamar a la IA.
+   */
+  private async _routeInternalIfCertain(
+    conversationId: string,
+    tenantId: string,
+    messageId: string,
+    isNewConversation: boolean,
+  ): Promise<boolean> {
+    const internalStateName = this.config.get<string>('INTERNAL_STATE_NAME') ?? 'Internos';
+    const internalState = await this.stateModel.findOne({
+      tenantId: new Types.ObjectId(tenantId),
+      name: internalStateName,
+      active: true,
+    });
+    if (!internalState) return false;
+
+    const conversation = await this.conversationModel.findOne({
+      _id: new Types.ObjectId(conversationId),
+      tenantId: new Types.ObjectId(tenantId),
+    });
+    if (!conversation) return false;
+
+    if (conversation.stateId?.toString() === (internalState._id as Types.ObjectId).toString()) {
+      await this.conversationModel.updateOne(
+        { _id: conversation._id },
+        { $set: { unread: false } },
+      );
+      return true;
+    }
+
+    if (!isNewConversation) return false;
+    if (!this.openAiService.isEnabled) return false;
+
+    const message = await this.messageModel.findById(messageId);
+    if (!message) return false;
+
+    const result = await this.openAiService.chatJson<InternalCheckResult>(
+      buildInternalCheckSystemPrompt(),
+      buildInternalCheckUserPrompt({
+        fromName: message.from?.name,
+        fromAddress: message.from?.address,
+        subject: message.subject,
+        bodyPreview: message.bodyPreview,
+      }),
+    );
+
+    const minConfidence = Number(this.config.get<string>('INTERNAL_MIN_CONFIDENCE') ?? '0.95');
+    if (
+      !result ||
+      result.internal !== true ||
+      typeof result.confidence !== 'number' ||
+      result.confidence < minConfidence
+    ) {
+      return false;
+    }
+
+    const category = result.category ?? 'automático';
+    await this.conversationModel.updateOne(
+      { _id: conversation._id },
+      {
+        $set: {
+          stateId: internalState._id,
+          unread: false,
+          aiProcessedAt: new Date(),
+          aiSummary: `Interno (${category}): ${result.reason ?? 'sin detalle'}`,
+        },
+        $push: {
+          statusHistory: {
+            stateId: internalState._id,
+            stateName: internalState.name,
+            changedBy: null,
+            changedAt: new Date(),
+            note: `auto: clasificado como interno por IA (${category}, confianza ${Math.round(result.confidence * 100)}%)`,
+          },
+        },
+      },
+    );
+
+    this.logger.log(
+      `Mail interno → "${internalState.name}" [conv=${conversationId}] categoría=${category} confianza=${result.confidence}`,
+    );
+    return true;
+  }
+
 
   /**
    * Procesa un mail entrante: clasifica la conversación (kanban) y genera una

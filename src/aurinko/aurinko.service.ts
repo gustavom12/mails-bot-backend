@@ -34,7 +34,15 @@ export interface AurinkoMessage {
   date?: string;
   isDraft: boolean;
   sysLabels: string[];
-  attachments: { id: string; name: string; mimeType: string; size: number; inline: boolean }[];
+  attachments: {
+    id: string;
+    name: string;
+    mimeType: string;
+    size: number;
+    inline: boolean;
+    // Content-ID del adjunto embebido; el HTML lo referencia como src="cid:{contentId}"
+    contentId?: string;
+  }[];
 }
 
 export interface AurinkoOutgoingAttachment {

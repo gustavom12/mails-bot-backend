@@ -51,6 +51,7 @@ export class AurinkoSyncService {
       size: a.size ?? 0,
       attachmentId: a.id,
       inline: a.inline ?? false,
+      contentId: a.contentId ?? null,
     }));
   }
 
@@ -91,6 +92,7 @@ export class AurinkoSyncService {
       graphConversationId: msg.threadId,
       tenantId: new Types.ObjectId(tenantId),
     });
+    const isNewConversation = !conversation;
 
     if (!conversation) {
       if (isOutbound) return false;
@@ -142,13 +144,15 @@ export class AurinkoSyncService {
       approvedBy: null,
     });
 
-    // Disparar triage IA solo para inbound y si la conversación ya tiene hotel asignado.
-    // Si no tiene hotel, la IA se dispara al asignarlo manualmente.
-    if (!isOutbound && conversation.hotelId) {
-      void this.aiTriageService.processInbound(
+    // Triage IA para inbound: primero decide si es un mail interno (transaccional,
+    // promocional, spam) y lo manda a "Internos"; si no, sigue el flujo normal
+    // (que requiere hotel asignado — sin hotel se procesa al asignarlo manualmente).
+    if (!isOutbound) {
+      void this.aiTriageService.triageInbound(
         (conversation._id as import('mongoose').Types.ObjectId).toString(),
         tenantId,
         (newMessage._id as import('mongoose').Types.ObjectId).toString(),
+        { newConversation: isNewConversation },
       );
     }
 
@@ -247,6 +251,7 @@ export class AurinkoSyncService {
           graphConversationId: msg.threadId,
           tenantId: new Types.ObjectId(tenantId),
         });
+        const isNewConversation = !conversation;
 
         if (!conversation) {
           // Solo crear conversación desde mensajes inbound
@@ -303,13 +308,15 @@ export class AurinkoSyncService {
           approvedBy: null,
         });
 
-        // Disparar triage IA solo para inbound y si la conversación ya tiene hotel asignado.
-        // Si no tiene hotel, la IA se dispara al asignarlo manualmente.
-        if (!isOutbound && conversation.hotelId) {
-          void this.aiTriageService.processInbound(
+        // Triage IA para inbound: primero decide si es un mail interno (transaccional,
+        // promocional, spam) y lo manda a "Internos"; si no, sigue el flujo normal
+        // (que requiere hotel asignado — sin hotel se procesa al asignarlo manualmente).
+        if (!isOutbound) {
+          void this.aiTriageService.triageInbound(
             (conversation._id as import('mongoose').Types.ObjectId).toString(),
             tenantId,
             (createdMsg._id as import('mongoose').Types.ObjectId).toString(),
+            { newConversation: isNewConversation },
           );
         }
 

@@ -346,7 +346,12 @@ export class ConversationsService {
         this.conversationModel.countDocuments({ ...base, unread: true }),
         scopeHotelIds
           ? Promise.resolve(0)
-          : this.conversationModel.countDocuments({ tenantId: tenantOid, hotelId: null }),
+          : this.conversationModel.countDocuments({
+              tenantId: tenantOid,
+              hotelId: null,
+              // Cerradas o internas ya no bloquean el triage ni requieren asignación.
+              ...(closedStateIds.length > 0 ? { stateId: { $nin: closedStateIds } } : {}),
+            }),
         this.conversationModel.countDocuments(waitingQuery),
         this.conversationModel.countDocuments(attentionQuery),
         this.conversationModel.countDocuments(needsReplyQuery),
