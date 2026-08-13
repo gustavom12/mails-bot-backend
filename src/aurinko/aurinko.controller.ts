@@ -96,6 +96,47 @@ export class AurinkoController {
     }
   }
 
+  /**
+   * Vincula una casilla con una cuenta YA conectada en Aurinko (sin repetir OAuth).
+   * Busca en las cuentas de la app una cuyo email coincida con el de la casilla,
+   * emite un access token vía account management y lo guarda cifrado.
+   *
+   * POST /aurinko/link/:mailboxId
+   */
+  @Roles('owner')
+  @Post('link/:mailboxId')
+  @HttpCode(200)
+  async link(
+    @CurrentUser() me: UserDocument,
+    @Param('mailboxId') mailboxId: string,
+  ) {
+    const tenantId = me.tenantId.toString();
+    const mailbox = await this.mailboxesService.findOne(tenantId, mailboxId);
+
+    const accounts = await this.aurinkoService.listAccounts();
+    const account = accounts.find(
+      (a) => a.email?.toLowerCase() === mailbox.email.toLowerCase() && a.active,
+    );
+    if (!account) {
+      throw new BadRequestException(
+        `No hay ninguna cuenta activa en Aurinko con el email ${mailbox.email}. ` +
+          `Conectala primero en Aurinko (o usá el botón Conectar para el flujo OAuth).`,
+      );
+    }
+
+    const accessToken = await this.aurinkoService.getAccountToken(account.id);
+    await this.mailboxesService.saveTokens(mailboxId, tenantId, {
+      accessToken: this.encryptionService.encrypt(accessToken),
+      refreshToken: null,
+      tokenExpiresAt: null,
+      aurinkoAccountId: account.id,
+      status: 'connected',
+    });
+
+    this.logger.log(`Casilla vinculada sin OAuth → mailbox=${mailbox.email} accountId=${account.id}`);
+    return { email: mailbox.email, accountId: account.id, status: 'connected' };
+  }
+
   // ─── Suscripción webhook ──────────────────────────────────────────────
 
   /**
@@ -135,6 +176,11 @@ export class AurinkoController {
   /**
    * Sincroniza los emails de una casilla conectada → popula Conversations + Messages.
    *
+   * Por defecto trae solo mensajes desde hoy (00:00 UTC) en adelante, para no
+   * importar todo el historial de la casilla. Body opcional:
+   *   { "full": true }                → historial completo
+   *   { "since": "2026-08-01" }       → desde una fecha específica
+   *
    * POST /aurinko/sync/:mailboxId
    */
   @Roles('owner')
@@ -143,9 +189,28 @@ export class AurinkoController {
   async sync(
     @CurrentUser() me: UserDocument,
     @Param('mailboxId') mailboxId: string,
+    @Body('full') full?: boolean,
+    @Body('since') since?: string,
   ) {
-    this.logger.log(`Manual sync → mailboxId=${mailboxId}`);
-    return this.aurinkoSyncService.syncMailbox(mailboxId, me.tenantId.toString());
+    let sinceDate: Date | null;
+    if (full === true) {
+      sinceDate = null;
+    } else if (since) {
+      sinceDate = new Date(since);
+      if (Number.isNaN(sinceDate.getTime())) {
+        throw new BadRequestException('El parámetro "since" no es una fecha válida');
+      }
+    } else {
+      sinceDate = new Date();
+      sinceDate.setUTCHours(0, 0, 0, 0);
+    }
+
+    this.logger.log(
+      `Manual sync → mailboxId=${mailboxId} since=${sinceDate ? sinceDate.toISOString() : 'historial completo'}`,
+    );
+    return this.aurinkoSyncService.syncMailbox(mailboxId, me.tenantId.toString(), {
+      since: sinceDate,
+    });
   }
 
   // ─── Endpoints de prueba ──────────────────────────────────────────────

@@ -163,6 +163,203 @@ export class AiTriageService {
     );
   }
 
+  /**
+   * Prepara un draft de seguimiento cuando el cliente no respondió.
+   * Busca templates con tags de seguimiento, adapta el body y lo guarda en
+   * aiSuggestedReply. Nunca envía el mail ni cambia el estado del kanban.
+   */
+  async prepareFollowupDraft(conversationId: string, tenantId: string): Promise<void> {
+    try {
+      await this._doPrepareFollowupDraft(conversationId, tenantId);
+    } catch (err) {
+      this.logger.error(`Error en draft de seguimiento [conv=${conversationId}]:`, err);
+    }
+  }
+
+  private async _doPrepareFollowupDraft(
+    conversationId: string,
+    tenantId: string,
+  ): Promise<void> {
+    const conversation = await this.conversationModel.findOne({
+      _id: new Types.ObjectId(conversationId),
+      tenantId: new Types.ObjectId(tenantId),
+    });
+
+    if (!conversation) {
+      this.logger.warn(`Followup draft: conversación no encontrada [conv=${conversationId}]`);
+      return;
+    }
+
+    if (!conversation.hotelId) {
+      this.logger.debug(
+        `Followup draft: conversación sin hotel [conv=${conversationId}], se omite`,
+      );
+      return;
+    }
+
+    const hotelId = conversation.hotelId.toString();
+    const followupTags = ['seguimiento', 'follow-up', 'followup', 'follow_up'];
+
+    let templates = await this.templatesService.findByTags(
+      tenantId,
+      hotelId,
+      followupTags,
+      5,
+    );
+
+    // Fallback: búsqueda por texto si no hay tags explícitos
+    if (templates.length === 0) {
+      templates = await this.templatesService.searchByText(
+        tenantId,
+        hotelId,
+        'seguimiento follow-up followup',
+        5,
+      );
+      // searchByText hace fallback a todos los templates del hotel; filtramos
+      // a los que parezcan de seguimiento por nombre/descripcion/tags.
+      templates = templates.filter((t) => {
+        const haystack = `${t.name} ${t.description} ${(t.tags ?? []).join(' ')}`.toLowerCase();
+        return /seguimiento|follow[\s_-]?up|followup/.test(haystack);
+      });
+    }
+
+    if (templates.length === 0) {
+      this.logger.debug(
+        `Followup draft: sin templates de seguimiento [conv=${conversationId} hotel=${hotelId}]`,
+      );
+      return;
+    }
+
+    const hotel = await this.hotelModel.findById(conversation.hotelId);
+    if (!hotel) {
+      this.logger.warn(`Followup draft: hotel no encontrado [hotelId=${hotelId}]`);
+      return;
+    }
+
+    const lastOutbound = await this.messageModel
+      .findOne({ conversationId: conversation._id, direction: 'outbound' })
+      .sort({ receivedAt: -1 })
+      .select('subject bodyPreview')
+      .lean()
+      .exec();
+
+    const contactName = conversation.contactName?.trim() || '';
+    let reply = this._applySimpleFollowupVars(templates[0].body, contactName);
+    let templateId = templates[0]._id as Types.ObjectId;
+    let source: 'template' | 'generated' = 'template';
+    let summary = `Seguimiento automático: template "${templates[0].name}"`;
+
+    if (this.openAiService.isEnabled) {
+      const adapted = await this.openAiService.chatJson<{
+        reply?: string;
+        templateId?: string;
+        summary?: string;
+      }>(
+        this._buildFollowupSystemPrompt(hotel),
+        this._buildFollowupUserPrompt(
+          {
+            subject: conversation.subject,
+            contactName,
+            contactEmail: conversation.contactEmail,
+            lastOutboundPreview: lastOutbound?.bodyPreview ?? '',
+          },
+          templates,
+        ),
+      );
+
+      if (adapted?.reply?.trim()) {
+        reply = adapted.reply.trim();
+        const matched = templates.find(
+          (t) => (t._id as Types.ObjectId).toString() === adapted.templateId,
+        );
+        if (matched) {
+          templateId = matched._id as Types.ObjectId;
+          summary = adapted.summary?.trim() || `Seguimiento automático: template "${matched.name}"`;
+        } else {
+          // La IA adaptó pero no devolvió un templateId válido: usamos el primero
+          summary = adapted.summary?.trim() || summary;
+        }
+        source = 'template';
+      }
+    }
+
+    await this.conversationModel.updateOne(
+      { _id: conversation._id },
+      {
+        $set: {
+          aiSuggestedReply: reply,
+          aiReplySource: source,
+          aiSuggestedTemplateId: templateId,
+          aiProcessedAt: new Date(),
+          aiSummary: summary,
+        },
+      },
+    );
+
+    this.logger.log(
+      `Followup draft listo [conv=${conversationId}] template=${templateId.toString()}`,
+    );
+  }
+
+  private _applySimpleFollowupVars(body: string, contactName: string): string {
+    if (!contactName) return body;
+    return body
+      .replace(/\[NOMBRE\]/gi, contactName)
+      .replace(/\[NAME\]/gi, contactName);
+  }
+
+  private _buildFollowupSystemPrompt(hotel: HotelDocument): string {
+    return `Eres un asistente de gestión de emails para el hotel "${hotel.name}".
+
+INFORMACIÓN DEL HOTEL:
+- Tono de comunicación: ${hotel.tone || 'Profesional y amable'}
+- Información de marca: ${hotel.brandInfo || 'Hotel de servicio premium'}
+- Reglas especiales: ${hotel.aiRules?.length ? hotel.aiRules.join('; ') : 'Ninguna'}
+
+CONTEXTO:
+El cliente no respondió tras un mensaje saliente del hotel. Debés preparar un mail de seguimiento amable usando UNO de los templates de seguimiento disponibles.
+
+INSTRUCCIONES:
+1. DEBES usar uno de los TEMPLATES DE SEGUIMIENTO indicados. Devuelve su templateId exacto.
+2. Adaptá variables como [NOMBRE] con el nombre del contacto si está disponible. No inventes disponibilidad, precios, habitaciones ni datos operativos.
+3. NO incluyas firma ni despedida firmada: la firma del hotel se agrega automáticamente.
+4. El campo "reply" DEBE ser HTML simple válido (<p>, <br>, <strong>, <em>, <ul>, <ol>, <li>). Preservá el formato HTML del template. No uses markdown.
+5. Sé conciso y profesional. No inventes que el cliente escribió algo nuevo.
+
+Responde ÚNICAMENTE con un objeto JSON:
+{
+  "reply": "<p>respuesta sugerida en HTML</p>",
+  "templateId": "id del template usado",
+  "summary": "resumen de 1 línea"
+}`;
+  }
+
+  private _buildFollowupUserPrompt(
+    ctx: {
+      subject: string;
+      contactName: string;
+      contactEmail: string;
+      lastOutboundPreview: string;
+    },
+    templates: { _id: unknown; name: string; description: string; body: string }[],
+  ): string {
+    const templatesBlock = templates
+      .map(
+        (t, i) =>
+          `[${i + 1}] ID: ${(t._id as Types.ObjectId).toString()}\nNombre: ${t.name}\nContexto: ${t.description}\nRespuesta (HTML): ${t.body}`,
+      )
+      .join('\n\n');
+
+    return `CONVERSACIÓN SIN RESPUESTA DEL CLIENTE:
+Asunto: ${ctx.subject}
+Contacto: ${ctx.contactName || '(sin nombre)'} <${ctx.contactEmail}>
+Último mensaje enviado por el hotel (preview):
+${ctx.lastOutboundPreview || '(no disponible)'}
+
+TEMPLATES DE SEGUIMIENTO:
+${templatesBlock}`;
+  }
+
   private async _findSimilarPrevious(
     tenantId: string,
     hotelId: string,
@@ -225,11 +422,12 @@ INSTRUCCIONES:
 4. La respuesta debe estar en el mismo idioma que el email entrante.
 5. NO incluyas ninguna firma ni despedida firmada al final: la firma del hotel se agrega automáticamente al responder, así que evitá duplicarla.
 6. Sé conciso y profesional.
+7. El campo "reply" DEBE ser HTML simple válido para un editor enriquecido (usá <p>, <br>, <strong>, <em>, <ul>, <ol>, <li>, <a> cuando corresponda). Si usás un template, preservá su formato HTML y solo adaptá el texto al email. No uses markdown.
 
 Responde ÚNICAMENTE con un objeto JSON con esta estructura exacta:
 {
   "stateName": "nombre exacto de la columna del kanban",
-  "reply": "texto de la respuesta sugerida",
+  "reply": "<p>respuesta sugerida en HTML</p>",
   "source": "template" | "generated",
   "templateId": "id del template usado (solo si source=template, sino omitir)",
   "summary": "resumen de 1 línea explicando la clasificación"
@@ -247,11 +445,11 @@ Responde ÚNICAMENTE con un objeto JSON con esta estructura exacta:
 
     if (templates.length > 0) {
       parts.push(
-        `\nTEMPLATES DISPONIBLES (relevantes por keywords):\n` +
+        `\nTEMPLATES DISPONIBLES (relevantes por keywords; el cuerpo es HTML):\n` +
           templates
             .map(
               (t, i) =>
-                `[${i + 1}] ID: ${(t._id as Types.ObjectId).toString()}\nNombre: ${t.name}\nContexto: ${t.description}\nRespuesta: ${t.body}`,
+                `[${i + 1}] ID: ${(t._id as Types.ObjectId).toString()}\nNombre: ${t.name}\nContexto: ${t.description}\nRespuesta (HTML): ${t.body}`,
             )
             .join('\n\n'),
       );

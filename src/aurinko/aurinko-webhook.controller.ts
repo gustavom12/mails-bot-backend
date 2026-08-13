@@ -164,7 +164,10 @@ export class AurinkoWebhookController {
     const mailboxId = (mailbox._id as import('mongoose').Types.ObjectId).toString();
 
     try {
-      const result = await this.aurinkoSyncService.syncMailbox(mailboxId, tenantId);
+      // Ventana de 7 días: alcanza para el mensaje nuevo y para recuperar
+      // huecos si el backend estuvo caído, sin re-importar el historial.
+      const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      const result = await this.aurinkoSyncService.syncMailbox(mailboxId, tenantId, { since });
       if (result.synced > 0) {
         this.logger.log(`Webhook sync ${mailbox.email}: +${result.synced} mensajes nuevos`);
       }

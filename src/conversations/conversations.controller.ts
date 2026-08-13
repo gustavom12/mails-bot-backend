@@ -58,6 +58,44 @@ export class ConversationsController {
     return { count };
   }
 
+  /**
+   * Hoteles visibles para el usuario en métricas: el owner ve todo (null);
+   * un admin solo los hoteles donde tiene el módulo 'inbox'.
+   */
+  private metricsScope(me: UserDocument): Types.ObjectId[] | null {
+    if (me.role === 'owner') return null;
+    return (me.hotelPermissions ?? [])
+      .filter((p) => p.modules.includes('inbox'))
+      .map((p) => p.hotelId);
+  }
+
+  /** Resumen operativo para el home del dashboard. */
+  @Get('dashboard')
+  dashboard(@CurrentUser() me: UserDocument) {
+    return this.conversationsService.getDashboardSummary(
+      me.tenantId.toString(),
+      this.metricsScope(me),
+    );
+  }
+
+  /** Estadísticas del dashboard: volumen diario, primera respuesta, envejecidas, por hotel/casilla. */
+  @Get('stats')
+  stats(
+    @CurrentUser() me: UserDocument,
+    @Query('days') days?: string,
+    @Query('hotelId') hotelId?: string,
+    @Query('mailboxId') mailboxId?: string,
+  ) {
+    const parsed = days ? parseInt(days) : 7;
+    const clamped = Math.min(90, Math.max(1, Number.isNaN(parsed) ? 7 : parsed));
+    return this.conversationsService.getStats(me.tenantId.toString(), {
+      days: clamped,
+      hotelId,
+      mailboxId,
+      scopeHotelIds: this.metricsScope(me),
+    });
+  }
+
   @Get(':id')
   findOne(@CurrentUser() me: UserDocument, @Param('id') id: string) {
     return this.conversationsService.findOne(me.tenantId.toString(), id);

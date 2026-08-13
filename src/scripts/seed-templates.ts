@@ -25,86 +25,64 @@ const TEMPLATES: TemplateSeed[] = [
     name: 'Disponibilidad y reservas',
     description:
       'Cuando el huésped consulta si hay habitaciones disponibles o quiere hacer/confirmar una reserva para determinadas fechas.',
-    body: `Estimado/a huésped,
-
-¡Gracias por su interés en hospedarse con nosotros! Con gusto le confirmamos que contamos con disponibilidad para las fechas consultadas.
-
-Para avanzar con la reserva, ¿podría indicarnos la cantidad de huéspedes y el tipo de habitación de su preferencia? Así le enviamos la cotización y las opciones disponibles.
-
-Quedamos atentos a su respuesta.
-
-Saludos cordiales,`,
+    body: `<p>Estimado/a huésped,</p>
+<p>¡Gracias por su interés en hospedarse con nosotros! Con gusto le confirmamos que contamos con disponibilidad para las fechas consultadas.</p>
+<p>Para avanzar con la reserva, ¿podría indicarnos la cantidad de huéspedes y el tipo de habitación de su preferencia? Así le enviamos la cotización y las opciones disponibles.</p>
+<p>Quedamos atentos a su respuesta.</p>
+<p>Saludos cordiales,</p>`,
     tags: ['reserva', 'disponibilidad', 'habitaciones', 'fechas'],
   },
   {
     name: 'Tarifas y precios',
     description:
       'Cuando el huésped pregunta por el precio de las habitaciones, tarifas por noche, promociones o cotización.',
-    body: `Estimado/a huésped,
-
-¡Gracias por escribirnos! Le compartimos que nuestras tarifas varían según la temporada y el tipo de habitación.
-
-Si nos indica las fechas exactas de su estadía y la cantidad de personas, le enviaremos una cotización personalizada con las mejores opciones y promociones vigentes.
-
-Quedamos a su disposición.
-
-Saludos cordiales,`,
+    body: `<p>Estimado/a huésped,</p>
+<p>¡Gracias por escribirnos! Le compartimos que nuestras tarifas varían según la temporada y el tipo de habitación.</p>
+<p>Si nos indica las fechas exactas de su estadía y la cantidad de personas, le enviaremos una cotización personalizada con las mejores opciones y promociones vigentes.</p>
+<p>Quedamos a su disposición.</p>
+<p>Saludos cordiales,</p>`,
     tags: ['tarifa', 'precio', 'cotización', 'promoción'],
   },
   {
     name: 'Horarios de check-in y check-out',
     description:
       'Cuando el huésped pregunta a qué hora puede ingresar (check-in) o hasta qué hora debe dejar la habitación (check-out), o sobre early check-in / late check-out.',
-    body: `Estimado/a huésped,
-
-¡Gracias por su consulta! Nuestro horario de check-in es a partir de las 15:00 hs y el check-out hasta las 11:00 hs.
-
-Si necesita un ingreso anticipado o una salida más tardía, con gusto verificamos la disponibilidad según la ocupación del día. No dude en avisarnos.
-
-Saludos cordiales,`,
+    body: `<p>Estimado/a huésped,</p>
+<p>¡Gracias por su consulta! Nuestro horario de check-in es a partir de las 15:00 hs y el check-out hasta las 11:00 hs.</p>
+<p>Si necesita un ingreso anticipado o una salida más tardía, con gusto verificamos la disponibilidad según la ocupación del día. No dude en avisarnos.</p>
+<p>Saludos cordiales,</p>`,
     tags: ['check-in', 'check-out', 'horario', 'ingreso', 'salida'],
   },
   {
     name: 'Cancelación de reserva',
     description:
       'Cuando el huésped desea cancelar o modificar una reserva ya realizada, o consulta por la política de cancelación.',
-    body: `Estimado/a huésped,
-
-Lamentamos que deba cancelar su reserva. Con gusto lo asistimos con el proceso.
-
-Nuestra política permite cancelaciones sin cargo hasta 48 hs antes de la fecha de llegada. Para gestionarla, por favor confírmenos el número de reserva y el nombre del titular.
-
-Quedamos atentos para ayudarle.
-
-Saludos cordiales,`,
+    body: `<p>Estimado/a huésped,</p>
+<p>Lamentamos que deba cancelar su reserva. Con gusto lo asistimos con el proceso.</p>
+<p>Nuestra política permite cancelaciones sin cargo hasta 48 hs antes de la fecha de llegada. Para gestionarla, por favor confírmenos el número de reserva y el nombre del titular.</p>
+<p>Quedamos atentos para ayudarle.</p>
+<p>Saludos cordiales,</p>`,
     tags: ['cancelación', 'modificación', 'política', 'reembolso'],
   },
   {
     name: 'Servicios e instalaciones',
     description:
       'Cuando el huésped pregunta por los servicios del hotel: wifi, desayuno, piscina, estacionamiento, mascotas, gimnasio, etc.',
-    body: `Estimado/a huésped,
-
-¡Gracias por su interés! Nuestro hotel ofrece Wi-Fi gratuito en todas las áreas, desayuno buffet incluido, estacionamiento sin cargo y servicio de recepción 24 hs.
-
-Si tiene alguna consulta específica sobre algún servicio en particular, con gusto le brindamos más detalles.
-
-Saludos cordiales,`,
+    body: `<p>Estimado/a huésped,</p>
+<p>¡Gracias por su interés! Nuestro hotel ofrece Wi-Fi gratuito en todas las áreas, desayuno buffet incluido, estacionamiento sin cargo y servicio de recepción 24 hs.</p>
+<p>Si tiene alguna consulta específica sobre algún servicio en particular, con gusto le brindamos más detalles.</p>
+<p>Saludos cordiales,</p>`,
     tags: ['servicios', 'wifi', 'desayuno', 'piscina', 'estacionamiento', 'mascotas'],
   },
   {
     name: 'Ubicación y cómo llegar',
     description:
       'Cuando el huésped pregunta por la dirección del hotel, cómo llegar, transfer desde el aeropuerto o estacionamiento.',
-    body: `Estimado/a huésped,
-
-¡Con gusto le ayudamos! Nos encontramos en una ubicación de fácil acceso, a pocos minutos del centro.
-
-Si nos indica su punto de partida y horario de llegada, podemos coordinar un servicio de transfer o brindarle indicaciones detalladas para llegar cómodamente.
-
-Quedamos a su disposición.
-
-Saludos cordiales,`,
+    body: `<p>Estimado/a huésped,</p>
+<p>¡Con gusto le ayudamos! Nos encontramos en una ubicación de fácil acceso, a pocos minutos del centro.</p>
+<p>Si nos indica su punto de partida y horario de llegada, podemos coordinar un servicio de transfer o brindarle indicaciones detalladas para llegar cómodamente.</p>
+<p>Quedamos a su disposición.</p>
+<p>Saludos cordiales,</p>`,
     tags: ['ubicación', 'dirección', 'cómo llegar', 'transfer', 'aeropuerto'],
   },
 ];

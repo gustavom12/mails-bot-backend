@@ -156,15 +156,29 @@ export class AurinkoSyncService {
   }
 
   /**
-   * Trae todos los mensajes de Aurinko usando paginación.
+   * Trae los mensajes de Aurinko usando paginación.
+   *
+   * Con `since`, descarta los mensajes anteriores a esa fecha y corta la
+   * paginación apenas una página entera queda fuera del rango (Aurinko
+   * devuelve los mensajes de más nuevo a más viejo). El filtro `q=after:` de
+   * la API no es confiable según el proveedor, por eso se filtra acá.
    */
-  private async fetchAllMessages(token: string): Promise<AurinkoMessage[]> {
+  private async fetchMessages(token: string, since: Date | null): Promise<AurinkoMessage[]> {
     const all: AurinkoMessage[] = [];
     let pageToken: string | undefined;
 
     do {
       const page = await this.aurinkoService.getMessages(token, pageToken, 50);
-      all.push(...page.records);
+      if (!since) {
+        all.push(...page.records);
+      } else {
+        const inRange = page.records.filter((m) => {
+          const date = new Date(m.receivedAt ?? m.sentAt ?? m.date ?? 0);
+          return date >= since;
+        });
+        all.push(...inRange);
+        if (page.records.length > 0 && inRange.length === 0) break;
+      }
       pageToken = page.nextPageToken;
     } while (pageToken);
 
@@ -176,8 +190,15 @@ export class AurinkoSyncService {
    * - Crea/actualiza Conversations (una por threadId)
    * - Crea Messages (uno por email)
    * Solo los mensajes de inbox y sent (no drafts).
+   *
+   * `since`: solo mensajes desde esa fecha (null = historial completo).
    */
-  async syncMailbox(mailboxId: string, tenantId: string): Promise<SyncResult> {
+  async syncMailbox(
+    mailboxId: string,
+    tenantId: string,
+    opts: { since?: Date | null } = {},
+  ): Promise<SyncResult> {
+    const since = opts.since ?? null;
     const mailbox = await this.mailboxModel.findOne({
       _id: new Types.ObjectId(mailboxId),
       tenantId: new Types.ObjectId(tenantId),
@@ -187,9 +208,11 @@ export class AurinkoSyncService {
     if (!mailbox) throw new Error('Casilla no encontrada o no conectada');
 
     const token = this.getAccessToken(mailbox);
-    const messages = await this.fetchAllMessages(token);
+    const messages = await this.fetchMessages(token, since);
 
-    this.logger.log(`Sync ${mailbox.email}: ${messages.length} mensajes totales`);
+    this.logger.log(
+      `Sync ${mailbox.email}: ${messages.length} mensajes${since ? ` desde ${since.toISOString()}` : ' (historial completo)'}`,
+    );
 
     // Asegurar que el tenant tiene estados configurados
     await this.statesService.seedDefaults(tenantId);

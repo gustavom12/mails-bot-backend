@@ -10,6 +10,7 @@ import {
   ConversationStateDocument,
 } from '../conversation-states/schemas/conversation-state.schema';
 import { ConversationsService } from './conversations.service';
+import { AiTriageService } from '../ai/ai-triage.service';
 
 @Injectable()
 export class ConversationFollowupService {
@@ -22,6 +23,7 @@ export class ConversationFollowupService {
     @InjectModel(ConversationState.name)
     private readonly stateModel: Model<ConversationStateDocument>,
     private readonly conversationsService: ConversationsService,
+    private readonly aiTriageService: AiTriageService,
     private readonly config: ConfigService,
   ) {}
 
@@ -72,13 +74,14 @@ export class ConversationFollowupService {
     // Buscar conversaciones cuyo lastActivityAt superó el umbral de inactividad
     const candidates = await this.conversationModel
       .find({ lastActivityAt: { $lt: cutoff } })
-      .select('_id tenantId stateId lastActivityAt')
+      .select('_id tenantId hotelId stateId lastActivityAt')
       .lean()
       .exec();
 
     this.logger.log(`Conversaciones candidatas: ${candidates.length}`);
 
     let updated = 0;
+    let drafts = 0;
     let skipped = 0;
 
     for (const conv of candidates) {
@@ -123,13 +126,20 @@ export class ConversationFollowupService {
         'auto: sin respuesta del cliente',
       );
       updated++;
+
+      // Preparar draft de seguimiento (templates) sin enviar el mail
+      if (conv.hotelId) {
+        await this.aiTriageService.prepareFollowupDraft(conversationId, tenantId);
+        drafts++;
+      }
+
       this.logger.debug(
         `Conv ${conversationId} marcada como "${attentionStateName}" (${ageDays.toFixed(1)}d sin respuesta)`,
       );
     }
 
     this.logger.log(
-      `Followup cron completado — "${attentionStateName}": ${updated}, saltadas: ${skipped}`,
+      `Followup cron completado — "${attentionStateName}": ${updated}, drafts: ${drafts}, saltadas: ${skipped}`,
     );
   }
 }

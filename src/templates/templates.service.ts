@@ -131,4 +131,35 @@ export class TemplatesService {
 
     return matches;
   }
+
+  /**
+   * Busca templates activos del hotel cuyos tags matchean alguno de los
+   * valores dados (case-insensitive). Usado p.ej. para drafts de seguimiento.
+   */
+  async findByTags(
+    tenantId: string,
+    hotelId: string,
+    tags: string[],
+    limit = 5,
+  ): Promise<ResponseTemplateDocument[]> {
+    const normalized = tags.map((t) => t.trim()).filter(Boolean);
+    if (normalized.length === 0) return [];
+
+    const tagRegexes = normalized.map((t) => new RegExp(`^${escapeRegex(t)}$`, 'i'));
+
+    return this.templateModel
+      .find({
+        tenantId: new Types.ObjectId(tenantId),
+        hotelId: new Types.ObjectId(hotelId),
+        active: true,
+        tags: { $in: tagRegexes },
+      })
+      .sort({ name: 1 })
+      .limit(limit)
+      .exec();
+  }
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }

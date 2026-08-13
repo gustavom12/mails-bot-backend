@@ -17,6 +17,7 @@ export class ResponseTemplate {
   @Prop({ required: true, trim: true })
   declare description: string;
 
+  /** Cuerpo HTML de la respuesta (editor enriquecido). */
   @Prop({ required: true })
   declare body: string;
 

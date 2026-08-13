@@ -286,6 +286,348 @@ export class ConversationsService {
     return result.map((r) => ({ stateId: r._id.toString(), count: r.count as number }));
   }
 
+  /**
+   * Resumen operativo del dashboard: solo conteos determinísticos + cola prioritaria.
+   * No calcula tasas, promedios ni métricas interpretativas.
+   *
+   * `scopeHotelIds`: hoteles visibles para el usuario (null = sin restricción, owner).
+   * Con scope, las conversaciones sin hotel quedan fuera (el admin no puede actuar sobre ellas).
+   */
+  async getDashboardSummary(tenantId: string, scopeHotelIds: Types.ObjectId[] | null = null) {
+    const tenantOid = new Types.ObjectId(tenantId);
+    const base: Record<string, unknown> = { tenantId: tenantOid };
+    if (scopeHotelIds) base.hotelId = { $in: scopeHotelIds };
+
+    const states = await this.statesService.findAll(tenantId);
+    const waitingStateName =
+      this.config.get<string>('FOLLOWUP_STATE_NAME') ?? 'Esperando respuesta cliente';
+    const attentionStateName =
+      this.config.get<string>('ATTENTION_STATE_NAME') ?? 'Requiere atención';
+
+    const waitingState = states.find((s) => s.name === waitingStateName);
+    const attentionState = states.find((s) => s.name === attentionStateName);
+    const closedStateIds = states.filter((s) => s.isClosed).map((s) => s._id as Types.ObjectId);
+
+    const waitingQuery = waitingState
+      ? { ...base, stateId: waitingState._id }
+      : { ...base, lastMessageDirection: 'outbound' as const };
+
+    const attentionQuery = attentionState
+      ? { ...base, stateId: attentionState._id }
+      : { ...base, _id: { $exists: false } }; // 0 si el estado no existe
+
+    const needsReplyQuery: Record<string, unknown> = {
+      ...base,
+      lastMessageDirection: 'inbound',
+    };
+    if (closedStateIds.length > 0) {
+      needsReplyQuery.stateId = { $nin: closedStateIds };
+    }
+
+    const priorityOr: Record<string, unknown>[] = [
+      { unread: true },
+      { lastMessageDirection: 'inbound' },
+    ];
+    if (!scopeHotelIds) priorityOr.push({ hotelId: null });
+    if (attentionState) {
+      priorityOr.push({ stateId: attentionState._id });
+    }
+
+    const priorityQuery: Record<string, unknown> = {
+      ...base,
+      $or: priorityOr,
+    };
+    if (closedStateIds.length > 0) {
+      priorityQuery.stateId = { $nin: closedStateIds };
+    }
+
+    const [unread, withoutHotel, waitingForClient, requiresAttention, needsReply, byStateRaw, priority] =
+      await Promise.all([
+        this.conversationModel.countDocuments({ ...base, unread: true }),
+        scopeHotelIds
+          ? Promise.resolve(0)
+          : this.conversationModel.countDocuments({ tenantId: tenantOid, hotelId: null }),
+        this.conversationModel.countDocuments(waitingQuery),
+        this.conversationModel.countDocuments(attentionQuery),
+        this.conversationModel.countDocuments(needsReplyQuery),
+        this.conversationModel.aggregate([
+          { $match: base },
+          { $group: { _id: '$stateId', count: { $sum: 1 } } },
+        ]),
+        this.conversationModel
+          .find(priorityQuery)
+          .sort({ unread: -1, lastActivityAt: -1 })
+          .limit(8)
+          .populate('mailboxId', 'email')
+          .populate('hotelId', 'name')
+          .populate('stateId', 'name color isClosed')
+          .populate('assignedTo', 'name email')
+          .lean()
+          .exec(),
+      ]);
+
+    const countByStateId = new Map<string, number>(
+      byStateRaw.map((r) => [r._id?.toString() ?? '', r.count as number]),
+    );
+
+    const byState = states
+      .filter((s) => s.active)
+      .sort((a, b) => a.order - b.order)
+      .map((s) => ({
+        stateId: (s._id as Types.ObjectId).toString(),
+        name: s.name,
+        color: s.color,
+        count: countByStateId.get((s._id as Types.ObjectId).toString()) ?? 0,
+        isClosed: s.isClosed,
+      }));
+
+    return {
+      unread,
+      withoutHotel,
+      waitingForClient,
+      requiresAttention,
+      needsReply,
+      byState,
+      priority,
+    };
+  }
+
+  /**
+   * Estadísticas del dashboard: volumen diario, tiempo de primera respuesta,
+   * conversaciones envejecidas y desglose por hotel y por casilla.
+   *
+   * `scopeHotelIds`: hoteles visibles para el usuario (null = sin restricción, owner).
+   * Fechas agrupadas en UTC.
+   */
+  async getStats(
+    tenantId: string,
+    opts: {
+      days: number;
+      hotelId?: string;
+      mailboxId?: string;
+      scopeHotelIds?: Types.ObjectId[] | null;
+    },
+  ) {
+    const tenantOid = new Types.ObjectId(tenantId);
+    const { days, hotelId, mailboxId, scopeHotelIds = null } = opts;
+
+    const from = new Date();
+    from.setUTCHours(0, 0, 0, 0);
+    from.setUTCDate(from.getUTCDate() - (days - 1));
+
+    // Restricción efectiva de hoteles: intersección entre el scope del usuario
+    // y el filtro pedido. Un hotelId fuera del scope produce resultados vacíos.
+    let hotelRestriction: Types.ObjectId[] | null = scopeHotelIds;
+    if (hotelId) {
+      const requested = new Types.ObjectId(hotelId);
+      hotelRestriction = scopeHotelIds
+        ? scopeHotelIds.filter((h) => h.equals(requested))
+        : [requested];
+    }
+    const mailboxOid = mailboxId ? new Types.ObjectId(mailboxId) : null;
+
+    const states = await this.statesService.findAll(tenantId);
+    const closedStateIds = states.filter((s) => s.isClosed).map((s) => s._id as Types.ObjectId);
+
+    // --- Volumen diario (mensajes recibidos vs. enviados) ---
+    const volumeMatch: Record<string, unknown> = { tenantId: tenantOid, receivedAt: { $gte: from } };
+    if (mailboxOid) volumeMatch.mailboxId = mailboxOid;
+
+    const volumePipeline: Record<string, unknown>[] = [{ $match: volumeMatch }];
+    if (hotelRestriction) {
+      volumePipeline.push(
+        { $lookup: { from: 'conversations', localField: 'conversationId', foreignField: '_id', as: 'conv' } },
+        { $unwind: '$conv' },
+        { $match: { 'conv.hotelId': { $in: hotelRestriction } } },
+      );
+    }
+    volumePipeline.push({
+      $group: {
+        _id: {
+          date: { $dateToString: { format: '%Y-%m-%d', date: '$receivedAt' } },
+          direction: '$direction',
+        },
+        count: { $sum: 1 },
+      },
+    });
+
+    // --- Primera respuesta: primer outbound - primer inbound por conversación ---
+    const frMatch: Record<string, unknown> = { tenantId: tenantOid, createdAt: { $gte: from } };
+    if (hotelRestriction) frMatch.hotelId = { $in: hotelRestriction };
+    if (mailboxOid) frMatch.mailboxId = mailboxOid;
+
+    const firstResponsePipeline: Record<string, unknown>[] = [
+      { $match: frMatch },
+      {
+        $lookup: {
+          from: 'messages',
+          let: { cid: '$_id' },
+          pipeline: [
+            { $match: { $expr: { $eq: ['$conversationId', '$$cid'] } } },
+            { $group: { _id: '$direction', first: { $min: '$receivedAt' } } },
+          ],
+          as: 'firsts',
+        },
+      },
+      { $project: { hotelId: 1, firsts: 1 } },
+    ];
+
+    // --- Envejecidas: pendientes de responder, sin actividad hace 24/48 h ---
+    const now = Date.now();
+    const agedBase: Record<string, unknown> = {
+      tenantId: tenantOid,
+      lastMessageDirection: 'inbound',
+    };
+    if (hotelRestriction) agedBase.hotelId = { $in: hotelRestriction };
+    if (mailboxOid) agedBase.mailboxId = mailboxOid;
+    if (closedStateIds.length > 0) agedBase.stateId = { $nin: closedStateIds };
+
+    // --- Desglose por hotel y por casilla ---
+    const notClosed =
+      closedStateIds.length > 0 ? { $not: [{ $in: ['$stateId', closedStateIds] }] } : { $literal: true };
+    const needsReplyCond = { $and: [{ $eq: ['$lastMessageDirection', 'inbound'] }, notClosed] };
+    const cutoff24 = new Date(now - 24 * 60 * 60 * 1000);
+    const groupCounters = {
+      open: { $sum: { $cond: [notClosed, 1, 0] } },
+      needsReply: { $sum: { $cond: [needsReplyCond, 1, 0] } },
+      unread: { $sum: { $cond: ['$unread', 1, 0] } },
+      aged24h: {
+        $sum: { $cond: [{ $and: [needsReplyCond, { $lt: ['$lastActivityAt', cutoff24] }] }, 1, 0] },
+      },
+    };
+
+    const byHotelMatch: Record<string, unknown> = {
+      tenantId: tenantOid,
+      hotelId: hotelRestriction ? { $in: hotelRestriction } : { $ne: null },
+    };
+    if (mailboxOid) byHotelMatch.mailboxId = mailboxOid;
+
+    const byMailboxMatch: Record<string, unknown> = { tenantId: tenantOid };
+    if (hotelRestriction) byMailboxMatch.hotelId = { $in: hotelRestriction };
+    if (mailboxOid) byMailboxMatch.mailboxId = mailboxOid;
+
+    const [volumeRaw, firstResponseRaw, aged24Count, aged48Count, byHotelRaw, byMailboxRaw, hotels, mailboxes] =
+      await Promise.all([
+        this.messageModel.aggregate(volumePipeline as never[]),
+        this.conversationModel.aggregate(firstResponsePipeline as never[]),
+        this.conversationModel.countDocuments({ ...agedBase, lastActivityAt: { $lt: cutoff24 } }),
+        this.conversationModel.countDocuments({
+          ...agedBase,
+          lastActivityAt: { $lt: new Date(now - 48 * 60 * 60 * 1000) },
+        }),
+        this.conversationModel.aggregate([
+          { $match: byHotelMatch },
+          { $group: { _id: '$hotelId', ...groupCounters } },
+        ] as never[]),
+        this.conversationModel.aggregate([
+          { $match: byMailboxMatch },
+          { $group: { _id: '$mailboxId', ...groupCounters } },
+        ] as never[]),
+        this.hotelModel.find({ tenantId: tenantOid }).select('name').lean().exec(),
+        this.mailboxModel.find({ tenantId: tenantOid }).select('email').lean().exec(),
+      ]);
+
+    // Serie diaria con días vacíos en cero
+    const volumeByKey = new Map<string, number>(
+      volumeRaw.map((r) => [`${r._id.date}|${r._id.direction}`, r.count as number]),
+    );
+    const volume: { date: string; inbound: number; outbound: number }[] = [];
+    for (let i = 0; i < days; i++) {
+      const d = new Date(from);
+      d.setUTCDate(d.getUTCDate() + i);
+      const key = d.toISOString().slice(0, 10);
+      volume.push({
+        date: key,
+        inbound: volumeByKey.get(`${key}|inbound`) ?? 0,
+        outbound: volumeByKey.get(`${key}|outbound`) ?? 0,
+      });
+    }
+
+    // Tiempos de primera respuesta (en minutos)
+    const diffs: { hotelId: string | null; minutes: number }[] = [];
+    for (const row of firstResponseRaw as {
+      hotelId: Types.ObjectId | null;
+      firsts: { _id: string; first: Date }[];
+    }[]) {
+      const firstInbound = row.firsts.find((f) => f._id === 'inbound')?.first;
+      const firstOutbound = row.firsts.find((f) => f._id === 'outbound')?.first;
+      if (!firstInbound || !firstOutbound) continue;
+      const ms = new Date(firstOutbound).getTime() - new Date(firstInbound).getTime();
+      if (ms <= 0) continue;
+      diffs.push({ hotelId: row.hotelId?.toString() ?? null, minutes: ms / 60000 });
+    }
+
+    const minutesList = diffs.map((d) => d.minutes).sort((a, b) => a - b);
+    const median = (list: number[]): number | null => {
+      if (list.length === 0) return null;
+      const mid = Math.floor(list.length / 2);
+      return list.length % 2 === 0 ? (list[mid - 1] + list[mid]) / 2 : list[mid];
+    };
+    const firstResponse = {
+      count: minutesList.length,
+      avgMinutes:
+        minutesList.length > 0
+          ? Math.round(minutesList.reduce((a, b) => a + b, 0) / minutesList.length)
+          : null,
+      medianMinutes: minutesList.length > 0 ? Math.round(median(minutesList) as number) : null,
+      buckets: {
+        under1h: minutesList.filter((m) => m < 60).length,
+        from1to4h: minutesList.filter((m) => m >= 60 && m < 240).length,
+        from4to24h: minutesList.filter((m) => m >= 240 && m < 1440).length,
+        over24h: minutesList.filter((m) => m >= 1440).length,
+      },
+    };
+
+    // Promedio de primera respuesta por hotel
+    const tfrByHotel = new Map<string, number[]>();
+    for (const d of diffs) {
+      if (!d.hotelId) continue;
+      const list = tfrByHotel.get(d.hotelId) ?? [];
+      list.push(d.minutes);
+      tfrByHotel.set(d.hotelId, list);
+    }
+
+    const hotelNames = new Map(hotels.map((h) => [(h._id as Types.ObjectId).toString(), h.name]));
+    const byHotel = byHotelRaw
+      .map((r) => {
+        const id = r._id?.toString() ?? '';
+        const tfrs = tfrByHotel.get(id);
+        return {
+          hotelId: id,
+          name: hotelNames.get(id) ?? '—',
+          open: r.open as number,
+          needsReply: r.needsReply as number,
+          unread: r.unread as number,
+          aged24h: r.aged24h as number,
+          avgFirstResponseMinutes:
+            tfrs && tfrs.length > 0 ? Math.round(tfrs.reduce((a, b) => a + b, 0) / tfrs.length) : null,
+        };
+      })
+      .sort((a, b) => b.needsReply - a.needsReply || b.open - a.open);
+
+    const mailboxEmails = new Map(mailboxes.map((m) => [(m._id as Types.ObjectId).toString(), m.email]));
+    const byMailbox = byMailboxRaw
+      .map((r) => ({
+        mailboxId: r._id?.toString() ?? '',
+        email: mailboxEmails.get(r._id?.toString() ?? '') ?? '—',
+        open: r.open as number,
+        needsReply: r.needsReply as number,
+        unread: r.unread as number,
+        aged24h: r.aged24h as number,
+      }))
+      .sort((a, b) => b.needsReply - a.needsReply || b.open - a.open);
+
+    return {
+      days,
+      from: from.toISOString(),
+      volume,
+      firstResponse,
+      aging: { over24h: aged24Count, over48h: aged48Count },
+      byHotel,
+      byMailbox,
+    };
+  }
+
   async getLastInboundMessage(tenantId: string, conversationId: string): Promise<MessageDocument | null> {
     const conversation = await this.conversationModel.findOne({
       _id: new Types.ObjectId(conversationId),

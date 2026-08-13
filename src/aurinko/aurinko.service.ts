@@ -99,6 +99,27 @@ export class AurinkoService {
     return { accountId: data.accountId as number, accessToken: data.accessToken as string };
   }
 
+  // ─── Account management (basic auth con credenciales de la app) ─────
+
+  /** Lista las cuentas ya conectadas a la app en Aurinko. */
+  async listAccounts(): Promise<AurinkoAccount[]> {
+    const { data } = await axios.get(`${AURINKO_BASE}/am/accounts`, {
+      auth: { username: this.clientId, password: this.clientSecret },
+    });
+    return (data.records ?? []) as AurinkoAccount[];
+  }
+
+  /**
+   * Emite un access token para una cuenta ya conectada en Aurinko,
+   * sin pasar por el flujo OAuth (la autorización ya existe en Aurinko).
+   */
+  async getAccountToken(accountId: number): Promise<string> {
+    const { data } = await axios.get(`${AURINKO_BASE}/am/accounts/${accountId}/token`, {
+      auth: { username: this.clientId, password: this.clientSecret },
+    });
+    return data.accessToken as string;
+  }
+
   // ─── Endpoints de la API ────────────────────────────────────────────
 
   private headers(token: string) {
