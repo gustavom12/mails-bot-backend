@@ -168,7 +168,8 @@ export class ConversationsController {
 
   /**
    * Asigna (o reasigna) el hotel de una conversación. Si la conversación tiene un
-   * mensaje inbound, dispara la sugerencia de IA con el contexto del hotel elegido.
+   * mensaje inbound, dispara el triage con el contexto del hotel elegido: los
+   * remitentes no-reply van a "Internos" y el resto sigue el flujo de sugerencia.
    */
   @Patch(':id/hotel')
   async assignHotel(
@@ -183,7 +184,7 @@ export class ConversationsController {
 
     const lastInbound = await this.conversationsService.getLastInboundMessage(tenantId, id);
     if (lastInbound) {
-      void this.aiTriageService.processInbound(
+      void this.aiTriageService.triageInbound(
         id,
         tenantId,
         (lastInbound._id as Types.ObjectId).toString(),

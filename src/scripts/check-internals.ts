@@ -1,9 +1,13 @@
 /**
  * Diagnóstico del clasificador de mails internos.
  *
- * Corre el MISMO proceso de clasificación que usa el webhook (mismos prompts,
- * mismo modelo, mismo umbral de confianza) sobre conversaciones existentes,
- * filtradas por CLI, y muestra si cada una iría a "Internos" o al flujo normal.
+ * Corre el MISMO proceso de clasificación que usa el webhook sobre
+ * conversaciones existentes, filtradas por CLI, y muestra si cada una iría a
+ * "Internos" o al flujo normal:
+ *   1. Remitentes no-reply (noreply@, no-reply@, do-not-reply@…) y dominios de
+ *      INTERNAL_SENDER_DOMAINS → "Internos" por regla determinística, sin
+ *      consultar a la IA.
+ *   2. El resto → mismos prompts, modelo y umbral de confianza que producción.
  *
  * Por defecto es un DRY-RUN: no modifica nada. Con --apply mueve efectivamente
  * a "Internos" las conversaciones que pasen el umbral.
@@ -20,14 +24,19 @@
  *   --contact <texto>    contactEmail contiene el texto (case-insensitive)
  *   --subject <texto>    asunto contiene el texto (case-insensitive)
  *   --limit <n>          máximo de conversaciones a evaluar (default: 20)
+ *   --no-ai              solo aplica las reglas determinísticas (no-reply y
+ *                        dominios internos); no usa la IA ni consume tokens.
+ *                        Alias: --noreply-only
  *   --apply              aplica los cambios (default: solo mostrar)
  *
  * Ejemplos:
  *   npm run internals:check -- --tenant 6a6bf9b2f89d1d90ed0a2aba --state Nuevo
  *   npm run internals:check -- --tenant 6a6bf9b2f89d1d90ed0a2aba --contact tripleseat --apply
+ *   npm run internals:check -- --tenant 6a6bf9b2f89d1d90ed0a2aba --no-ai --limit 500 --apply
  *
  * Variables de entorno: MONGODB_URI, OPENAI_API_KEY, OPENAI_MODEL,
- * INTERNAL_STATE_NAME (default "Internos"), INTERNAL_MIN_CONFIDENCE (default 0.95).
+ * INTERNAL_STATE_NAME (default "Internos"), INTERNAL_MIN_CONFIDENCE (default 0.95),
+ * INTERNAL_SENDER_DOMAINS (default "uber.com,hotelplanner.com").
  */
 import * as mongoose from 'mongoose';
 import * as dotenv from 'dotenv';
@@ -36,6 +45,9 @@ import OpenAI from 'openai';
 import {
   buildInternalCheckSystemPrompt,
   buildInternalCheckUserPrompt,
+  matchInternalSenderRule,
+  messagePlainText,
+  parseInternalSenderDomains,
   InternalCheckResult,
 } from '../ai/ai-triage.service';
 
@@ -45,6 +57,7 @@ const MONGODB_URI = process.env.MONGODB_URI ?? 'mongodb://localhost:27017/mails-
 const OPENAI_MODEL = process.env.OPENAI_MODEL ?? 'gpt-4o';
 const INTERNAL_STATE_NAME = process.env.INTERNAL_STATE_NAME ?? 'Internos';
 const MIN_CONFIDENCE = Number(process.env.INTERNAL_MIN_CONFIDENCE ?? '0.95');
+const INTERNAL_SENDER_DOMAINS = parseInternalSenderDomains(process.env.INTERNAL_SENDER_DOMAINS);
 
 // ─── Parseo de argumentos ────────────────────────────────────────────────────
 function parseArgs(argv: string[]): Record<string, string | boolean> {
@@ -67,14 +80,19 @@ function parseArgs(argv: string[]): Record<string, string | boolean> {
 async function run() {
   const args = parseArgs(process.argv.slice(2));
   const apply = args.apply === true;
+  // --noreply-only se mantiene como alias histórico de --no-ai.
+  const noAi = args['no-ai'] === true || args['noreply-only'] === true;
   const limit = Number(args.limit ?? '20');
 
   const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    console.error('✖ Falta OPENAI_API_KEY en el .env — el clasificador necesita la IA.');
+  if (!apiKey && !noAi) {
+    console.error(
+      '✖ Falta OPENAI_API_KEY en el .env — el clasificador necesita la IA ' +
+        '(o usá --no-ai, que solo aplica las reglas determinísticas).',
+    );
     process.exit(1);
   }
-  const openai = new OpenAI({ apiKey });
+  const openai = apiKey ? new OpenAI({ apiKey }) : null;
 
   console.log(`🔌 Conectando a ${MONGODB_URI.replace(/\/\/[^@]*@/, '//***@')}…`);
   const conn = await mongoose.createConnection(MONGODB_URI).asPromise();
@@ -151,8 +169,38 @@ async function run() {
 
   console.log(
     `\n📦 ${targets.length} conversación(es) a evaluar — umbral de confianza: ${MIN_CONFIDENCE}` +
+      ` — dominios internos: ${INTERNAL_SENDER_DOMAINS.join(', ') || '(ninguno)'}` +
+      `${noAi ? ' — solo reglas determinísticas (sin IA)' : ''}` +
       ` — modo: ${apply ? '⚠️  APPLY (mueve a Internos)' : 'dry-run (solo muestra)'}\n`,
   );
+
+  const moveToInternal = async (
+    conversationId: unknown,
+    summary: string,
+    note: string,
+  ): Promise<void> => {
+    await conversations.updateOne(
+      { _id: conversationId as mongoose.Types.ObjectId },
+      {
+        $set: {
+          stateId: internalState._id,
+          unread: false,
+          aiProcessedAt: new Date(),
+          aiSummary: summary,
+        },
+        $push: {
+          statusHistory: {
+            stateId: internalState._id,
+            stateName: internalState.name,
+            changedBy: null,
+            changedAt: new Date(),
+            note,
+          },
+        } as never,
+      },
+    );
+    console.log('      ✔ movida a Internos');
+  };
 
   let toInternal = 0;
   let normalFlow = 0;
@@ -182,9 +230,29 @@ async function run() {
     }
     const msg = lastInbound[0];
 
+    // Reglas determinísticas (no-reply / dominio interno): sin llamar a la IA.
+    const senderRule = matchInternalSenderRule(msg.from?.address, INTERNAL_SENDER_DOMAINS);
+    if (senderRule) {
+      toInternal++;
+      console.log(`🟣 → INTERNOS  ${label}\n      regla ${senderRule.rule}: ${senderRule.detail}`);
+      if (apply) {
+        await moveToInternal(
+          conv._id,
+          `Interno (${senderRule.rule}): ${senderRule.detail}`,
+          `auto: ${senderRule.detail} [script]`,
+        );
+      }
+      continue;
+    }
+
+    if (noAi) {
+      skipped++;
+      continue;
+    }
+
     let result: InternalCheckResult | null = null;
     try {
-      const completion = await openai.chat.completions.create({
+      const completion = await openai!.chat.completions.create({
         model: OPENAI_MODEL,
         temperature: 0.3,
         max_tokens: 500,
@@ -197,7 +265,10 @@ async function run() {
               fromName: msg.from?.name,
               fromAddress: msg.from?.address,
               subject: msg.subject,
-              bodyPreview: msg.bodyPreview,
+              bodyPreview: messagePlainText(
+                msg as { bodyHtml?: string; bodyPreview?: string },
+                800,
+              ),
             }),
           },
         ],
@@ -223,27 +294,11 @@ async function run() {
       toInternal++;
       console.log(`🟣 → INTERNOS  ${label}\n      ${detail}`);
       if (apply) {
-        await conversations.updateOne(
-          { _id: conv._id },
-          {
-            $set: {
-              stateId: internalState._id,
-              unread: false,
-              aiProcessedAt: new Date(),
-              aiSummary: `Interno (${result!.category ?? 'automático'}): ${result!.reason ?? 'sin detalle'}`,
-            },
-            $push: {
-              statusHistory: {
-                stateId: internalState._id,
-                stateName: internalState.name,
-                changedBy: null,
-                changedAt: new Date(),
-                note: `auto: clasificado como interno por IA (${result!.category ?? 'automático'}, confianza ${Math.round(result!.confidence * 100)}%) [script]`,
-              },
-            } as never,
-          },
+        await moveToInternal(
+          conv._id,
+          `Interno (${result!.category ?? 'automático'}): ${result!.reason ?? 'sin detalle'}`,
+          `auto: clasificado como interno por IA (${result!.category ?? 'automático'}, confianza ${Math.round(result!.confidence * 100)}%) [script]`,
         );
-        console.log('      ✔ movida a Internos');
       }
     } else {
       normalFlow++;

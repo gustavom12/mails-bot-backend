@@ -622,6 +622,8 @@ export class ConversationsService {
       }))
       .sort((a, b) => b.needsReply - a.needsReply || b.open - a.open);
 
+    const clients = await this.getClientStats(tenantOid, hotelRestriction, mailboxOid, closedStateIds);
+
     return {
       days,
       from: from.toISOString(),
@@ -630,6 +632,133 @@ export class ConversationsService {
       aging: { over24h: aged24Count, over48h: aged48Count },
       byHotel,
       byMailbox,
+      clients,
+    };
+  }
+
+  /**
+   * Comportamiento de clientes/leads en los últimos 90 días:
+   * - cuánto tardan en responder tras un mensaje nuestro (deltas outbound→inbound)
+   * - cuántos responden vs. cuántos dejan de responder (silencio > ATTENTION_AFTER_DAYS
+   *   tras nuestra respuesta, excluyendo conversaciones cerradas/internas)
+   */
+  private async getClientStats(
+    tenantOid: Types.ObjectId,
+    hotelRestriction: Types.ObjectId[] | null,
+    mailboxOid: Types.ObjectId | null,
+    closedStateIds: Types.ObjectId[],
+  ) {
+    const windowDays = 90;
+    const since = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000);
+    const ghostDays = Number(this.config.get<string>('ATTENTION_AFTER_DAYS') ?? '5');
+    const ghostMs = ghostDays * 24 * 60 * 60 * 1000;
+
+    const convMatch: Record<string, unknown> = { tenantId: tenantOid, lastActivityAt: { $gte: since } };
+    if (hotelRestriction) convMatch.hotelId = { $in: hotelRestriction };
+    if (mailboxOid) convMatch.mailboxId = mailboxOid;
+
+    const convs = await this.conversationModel
+      .find(convMatch)
+      .select('_id lastMessageDirection lastActivityAt stateId')
+      .lean()
+      .exec();
+
+    const empty = {
+      windowDays,
+      ghostDays,
+      responses: 0,
+      avgMinutes: null as number | null,
+      medianMinutes: null as number | null,
+      buckets: { under1h: 0, from1to4h: 0, from4to24h: 0, from1to3d: 0, over3d: 0 },
+      withOurReply: 0,
+      responded: 0,
+      ghosted: 0,
+      awaiting: 0,
+    };
+    if (convs.length === 0) return empty;
+
+    const messages = await this.messageModel
+      .find({ conversationId: { $in: convs.map((c) => c._id) } })
+      .select('conversationId direction receivedAt')
+      .sort({ receivedAt: 1 })
+      .lean()
+      .exec();
+
+    const byConv = new Map<string, { direction: string; receivedAt: Date }[]>();
+    for (const m of messages) {
+      const key = m.conversationId.toString();
+      const list = byConv.get(key) ?? [];
+      list.push({ direction: m.direction, receivedAt: m.receivedAt });
+      byConv.set(key, list);
+    }
+
+    const closedSet = new Set(closedStateIds.map((s) => s.toString()));
+    const deltas: number[] = [];
+    let withOurReply = 0;
+    let responded = 0;
+    let ghosted = 0;
+    let awaiting = 0;
+    const now = Date.now();
+
+    for (const conv of convs) {
+      const seq = byConv.get((conv._id as Types.ObjectId).toString()) ?? [];
+      let pendingOutboundAt: number | null = null;
+      let hasOutbound = false;
+      let convResponses = 0;
+
+      for (const m of seq) {
+        if (m.direction === 'outbound') {
+          hasOutbound = true;
+          // Se mide desde el primer mensaje nuestro sin responder
+          pendingOutboundAt = pendingOutboundAt ?? new Date(m.receivedAt).getTime();
+        } else if (pendingOutboundAt !== null) {
+          const ms = new Date(m.receivedAt).getTime() - pendingOutboundAt;
+          if (ms > 0) {
+            deltas.push(ms / 60000);
+            convResponses++;
+          }
+          pendingOutboundAt = null;
+        }
+      }
+
+      if (!hasOutbound) continue;
+      withOurReply++;
+      if (convResponses > 0) responded++;
+
+      // Silencio del cliente: respondimos último y la conversación sigue abierta
+      const isClosed = closedSet.has(conv.stateId?.toString() ?? '');
+      if (conv.lastMessageDirection === 'outbound' && !isClosed) {
+        const silentMs = now - new Date(conv.lastActivityAt).getTime();
+        if (silentMs > ghostMs) ghosted++;
+        else awaiting++;
+      }
+    }
+
+    const sorted = [...deltas].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    const medianMinutes =
+      sorted.length === 0
+        ? null
+        : Math.round(sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid]);
+
+    return {
+      windowDays,
+      ghostDays,
+      responses: deltas.length,
+      avgMinutes:
+        deltas.length > 0 ? Math.round(deltas.reduce((a, b) => a + b, 0) / deltas.length) : null,
+      medianMinutes,
+      buckets: {
+        under1h: deltas.filter((m) => m < 60).length,
+        from1to4h: deltas.filter((m) => m >= 60 && m < 240).length,
+        from4to24h: deltas.filter((m) => m >= 240 && m < 1440).length,
+        from1to3d: deltas.filter((m) => m >= 1440 && m < 4320).length,
+        over3d: deltas.filter((m) => m >= 4320).length,
+      },
+      withOurReply,
+      responded,
+      ghosted,
+      awaiting,
     };
   }
 

@@ -8,6 +8,19 @@ import { Hotel, HotelDocument } from '../hotels/schemas/hotel.schema';
 import { ConversationState, ConversationStateDocument } from '../conversation-states/schemas/conversation-state.schema';
 import { TemplatesService } from '../templates/templates.service';
 import { OpenAiService } from './openai.service';
+import { stripHtml } from '../common/utils/html';
+
+/**
+ * Texto plano de un mensaje para consumo de la IA: usa el body HTML completo
+ * (no el snippet truncado del proveedor) y cae al preview solo si no hay body.
+ */
+export function messagePlainText(
+  msg: { bodyHtml?: string | null; bodyPreview?: string | null },
+  maxChars: number,
+): string {
+  const text = stripHtml(msg.bodyHtml ?? '') || (msg.bodyPreview ?? '').trim();
+  return text.slice(0, maxChars);
+}
 
 interface TriageResult {
   stateName: string;
@@ -22,6 +35,73 @@ export interface InternalCheckResult {
   confidence: number;
   category?: string;
   reason?: string;
+}
+
+/**
+ * Detecta direcciones no-reply (noreply@, no-reply@, no_reply@, do-not-reply@,
+ * donotreply@, mail-noreply@…). Son remitentes automáticos que por definición
+ * no esperan respuesta, así que van directo a "Internos" sin consultar a la IA.
+ *
+ * Se normaliza la parte local (se quitan separadores y dígitos) para cubrir
+ * todas las variantes de escritura con una sola comparación.
+ */
+export function isNoReplyAddress(address?: string | null): boolean {
+  const normalizedAddress = (address ?? '').trim().toLowerCase();
+  if (!normalizedAddress.includes('@')) return false;
+
+  const localPart = normalizedAddress.split('@')[0].replace(/[^a-z]/g, '');
+  return localPart.includes('noreply') || localPart.includes('donotreply');
+}
+
+/**
+ * Dominios cuyos mails van siempre a "Internos", sin importar el remitente ni
+ * el contenido. Se pueden sobrescribir con INTERNAL_SENDER_DOMAINS.
+ */
+export const DEFAULT_INTERNAL_SENDER_DOMAINS = ['uber.com', 'hotelplanner.com'];
+
+/**
+ * Parsea la lista de dominios internos desde la config (separados por coma).
+ * Sin la variable definida se usan los defaults; definida y vacía, la regla de
+ * dominios queda desactivada.
+ */
+export function parseInternalSenderDomains(raw?: string | null): string[] {
+  if (raw === undefined || raw === null) return DEFAULT_INTERNAL_SENDER_DOMAINS;
+
+  return raw
+    .split(',')
+    .map((d) => d.trim().toLowerCase().replace(/^@/, ''))
+    .filter(Boolean);
+}
+
+/** True si el remitente pertenece a uno de los dominios internos (o a un subdominio suyo). */
+export function isInternalSenderDomain(
+  address: string | null | undefined,
+  domains: string[],
+): boolean {
+  const domain = (address ?? '').trim().toLowerCase().split('@')[1];
+  if (!domain) return false;
+
+  return domains.some((d) => domain === d || domain.endsWith(`.${d}`));
+}
+
+/**
+ * Reglas determinísticas que mandan un mail a "Internos" ANTES de llamar a la
+ * IA (así no se gastan tokens en remitentes que ya sabemos que no requieren
+ * atención). Devuelve null si el mail tiene que seguir al clasificador.
+ */
+export function matchInternalSenderRule(
+  address: string | null | undefined,
+  domains: string[],
+): { rule: string; detail: string } | null {
+  const from = address?.trim() || '(sin remitente)';
+
+  if (isNoReplyAddress(address)) {
+    return { rule: 'no-reply', detail: `remitente no-reply (${from})` };
+  }
+  if (isInternalSenderDomain(address, domains)) {
+    return { rule: 'dominio', detail: `dominio interno (${from})` };
+  }
+  return null;
 }
 
 /**
@@ -106,14 +186,20 @@ export class AiTriageService {
   }
 
   /**
-   * Clasifica el mail como interno SOLO si la IA está totalmente segura de que
-   * no requiere respuesta ni acción humana. Devuelve true si lo enrutó.
+   * Enruta el mail a la columna "Internos" cuando no requiere atención humana.
+   * Devuelve true si lo enrutó.
    *
    * - Requiere que exista un estado activo con nombre INTERNAL_STATE_NAME
    *   (default "Internos") en el tenant; si no existe, no hace nada.
-   * - Solo clasifica conversaciones nuevas: un hilo con historial humano nunca
-   *   se archiva solo. Los mensajes siguientes de un hilo ya interno se
-   *   mantienen leídos y en la misma columna, sin volver a llamar a la IA.
+   * - Remitentes no-reply (noreply@, no-reply@, do-not-reply@…) y dominios de
+   *   INTERNAL_SENDER_DOMAINS: reglas determinísticas, se cortan antes de la IA
+   *   (no gastan tokens) y aplican tanto a conversaciones nuevas como a hilos
+   *   que ya tenían mensajes.
+   * - El resto se clasifica con IA SOLO en conversaciones nuevas y solo si está
+   *   totalmente segura: un hilo con historial humano nunca se archiva solo.
+   *   Los mensajes siguientes de un hilo ya interno se mantienen leídos y en la
+   *   misma columna, sin volver a llamar a la IA.
+   * - Si un usuario movió la conversación a mano, se respeta su decisión.
    */
   private async _routeInternalIfCertain(
     conversationId: string,
@@ -143,11 +229,34 @@ export class AiTriageService {
       return true;
     }
 
-    if (!isNewConversation) return false;
-    if (!this.openAiService.isEnabled) return false;
-
     const message = await this.messageModel.findById(messageId);
     if (!message) return false;
+
+    // Reglas determinísticas (remitente no-reply o dominio interno): van a
+    // "Internos" sin llamar a la IA — se cortan antes para no gastar tokens.
+    // Solo se respeta la decisión de un humano que la movió a mano.
+    const senderRule = matchInternalSenderRule(
+      message.from?.address,
+      parseInternalSenderDomains(this.config.get<string>('INTERNAL_SENDER_DOMAINS')),
+    );
+
+    if (senderRule) {
+      if (this._movedByHuman(conversation)) return false;
+
+      await this._moveToInternal(conversation, internalState, {
+        summary: `Interno (${senderRule.rule}): ${senderRule.detail}`,
+        note: `auto: ${senderRule.detail}`,
+      });
+
+      this.logger.log(
+        `Mail interno por regla "${senderRule.rule}" → "${internalState.name}" ` +
+          `[conv=${conversationId}] ${senderRule.detail}`,
+      );
+      return true;
+    }
+
+    if (!isNewConversation) return false;
+    if (!this.openAiService.isEnabled) return false;
 
     const result = await this.openAiService.chatJson<InternalCheckResult>(
       buildInternalCheckSystemPrompt(),
@@ -155,7 +264,7 @@ export class AiTriageService {
         fromName: message.from?.name,
         fromAddress: message.from?.address,
         subject: message.subject,
-        bodyPreview: message.bodyPreview,
+        bodyPreview: messagePlainText(message, 800),
       }),
     );
 
@@ -170,26 +279,10 @@ export class AiTriageService {
     }
 
     const category = result.category ?? 'automático';
-    await this.conversationModel.updateOne(
-      { _id: conversation._id },
-      {
-        $set: {
-          stateId: internalState._id,
-          unread: false,
-          aiProcessedAt: new Date(),
-          aiSummary: `Interno (${category}): ${result.reason ?? 'sin detalle'}`,
-        },
-        $push: {
-          statusHistory: {
-            stateId: internalState._id,
-            stateName: internalState.name,
-            changedBy: null,
-            changedAt: new Date(),
-            note: `auto: clasificado como interno por IA (${category}, confianza ${Math.round(result.confidence * 100)}%)`,
-          },
-        },
-      },
-    );
+    await this._moveToInternal(conversation, internalState, {
+      summary: `Interno (${category}): ${result.reason ?? 'sin detalle'}`,
+      note: `auto: clasificado como interno por IA (${category}, confianza ${Math.round(result.confidence * 100)}%)`,
+    });
 
     this.logger.log(
       `Mail interno → "${internalState.name}" [conv=${conversationId}] categoría=${category} confianza=${result.confidence}`,
@@ -197,6 +290,38 @@ export class AiTriageService {
     return true;
   }
 
+  /** True si algún cambio de estado lo hizo una persona (no el sistema). */
+  private _movedByHuman(conversation: ConversationDocument): boolean {
+    return (conversation.statusHistory ?? []).some((h) => h.changedBy != null);
+  }
+
+  /** Mueve la conversación a la columna "Internos", leída y sin pedir atención. */
+  private async _moveToInternal(
+    conversation: ConversationDocument,
+    internalState: ConversationStateDocument,
+    meta: { summary: string; note: string },
+  ): Promise<void> {
+    await this.conversationModel.updateOne(
+      { _id: conversation._id },
+      {
+        $set: {
+          stateId: internalState._id,
+          unread: false,
+          aiProcessedAt: new Date(),
+          aiSummary: meta.summary,
+        },
+        $push: {
+          statusHistory: {
+            stateId: internalState._id,
+            stateName: internalState.name,
+            changedBy: null,
+            changedAt: new Date(),
+            note: meta.note,
+          },
+        },
+      },
+    );
+  }
 
   /**
    * Procesa un mail entrante: clasifica la conversación (kanban) y genera una
@@ -236,7 +361,9 @@ export class AiTriageService {
       return;
     }
 
-    const emailText = `${message.subject ?? ''}\n\n${message.bodyPreview ?? ''}`.trim();
+    // Body completo (sin HTML, con tope) — el bodyPreview del proveedor es un
+    // snippet corto y truncaba el contexto que veía la IA.
+    const emailText = `${message.subject ?? ''}\n\n${messagePlainText(message, 8000)}`.trim();
 
     // Sin hotel asignado no hay contexto para la IA: se procesará al asignarlo manualmente.
     if (!conversation.hotelId) {
@@ -408,7 +535,7 @@ export class AiTriageService {
     const lastOutbound = await this.messageModel
       .findOne({ conversationId: conversation._id, direction: 'outbound' })
       .sort({ receivedAt: -1 })
-      .select('subject bodyPreview')
+      .select('subject bodyHtml bodyPreview')
       .lean()
       .exec();
 
@@ -430,7 +557,7 @@ export class AiTriageService {
             subject: conversation.subject,
             contactName,
             contactEmail: conversation.contactEmail,
-            lastOutboundPreview: lastOutbound?.bodyPreview ?? '',
+            lastOutboundPreview: lastOutbound ? messagePlainText(lastOutbound, 1200) : '',
           },
           templates,
         ),
@@ -555,7 +682,7 @@ ${templatesBlock}`;
 
       return messages.map((m) => ({
         subject: m.subject ?? '',
-        preview: m.bodyPreview?.slice(0, 300) ?? '',
+        preview: messagePlainText(m, 300),
       }));
     } catch {
       return [];

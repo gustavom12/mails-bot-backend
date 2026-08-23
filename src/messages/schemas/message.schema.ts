@@ -77,7 +77,9 @@ export const MessageSchema = SchemaFactory.createForClass(Message);
 
 MessageSchema.index({ tenantId: 1, createdAt: -1 });
 MessageSchema.index({ conversationId: 1, receivedAt: 1 });
+// default_language spanish: sin él Mongo aplica stemming inglés y las búsquedas
+// en español matchean peor (plurales, conjugaciones).
 MessageSchema.index(
   { subject: 'text', bodyPreview: 'text' },
-  { weights: { subject: 5, bodyPreview: 3 }, name: 'message_text_idx' },
+  { weights: { subject: 5, bodyPreview: 3 }, name: 'message_text_idx', default_language: 'spanish' },
 );

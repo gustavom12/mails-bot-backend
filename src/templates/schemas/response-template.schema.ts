@@ -35,7 +35,13 @@ export const ResponseTemplateSchema = SchemaFactory.createForClass(ResponseTempl
 
 ResponseTemplateSchema.index({ tenantId: 1, hotelId: 1 });
 ResponseTemplateSchema.index({ tenantId: 1, hotelId: 1, name: 1 }, { unique: true });
+// default_language spanish: sin él Mongo aplica stemming inglés y las búsquedas
+// en español matchean peor (plurales, conjugaciones).
 ResponseTemplateSchema.index(
   { name: 'text', description: 'text', body: 'text', tags: 'text' },
-  { weights: { name: 10, description: 5, body: 3, tags: 4 }, name: 'response_template_text_idx' },
+  {
+    weights: { name: 10, description: 5, body: 3, tags: 4 },
+    name: 'response_template_text_idx',
+    default_language: 'spanish',
+  },
 );
