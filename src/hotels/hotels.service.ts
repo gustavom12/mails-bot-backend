@@ -50,6 +50,8 @@ export class HotelsService {
       signature: dto.signature ?? '',
       brandInfo: dto.brandInfo ?? '',
       aiRules: dto.aiRules ?? [],
+      matchAliases: dto.matchAliases ?? [],
+      matchDomains: dto.matchDomains ?? [],
       active: true,
     });
   }
@@ -90,6 +92,8 @@ export class HotelsService {
     if (dto.signature !== undefined) hotel.signature = dto.signature;
     if (dto.brandInfo !== undefined) hotel.brandInfo = dto.brandInfo;
     if (dto.aiRules !== undefined) hotel.aiRules = dto.aiRules;
+    if (dto.matchAliases !== undefined) hotel.matchAliases = dto.matchAliases;
+    if (dto.matchDomains !== undefined) hotel.matchDomains = dto.matchDomains;
     if (dto.active !== undefined) hotel.active = dto.active;
 
     return hotel.save();

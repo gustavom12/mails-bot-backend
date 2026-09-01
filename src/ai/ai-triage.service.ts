@@ -5,7 +5,10 @@ import { Model, Types } from 'mongoose';
 import { Conversation, ConversationDocument } from '../conversations/schemas/conversation.schema';
 import { Message, MessageDocument } from '../messages/schemas/message.schema';
 import { Hotel, HotelDocument } from '../hotels/schemas/hotel.schema';
-import { ConversationState, ConversationStateDocument } from '../conversation-states/schemas/conversation-state.schema';
+import {
+  ConversationState,
+  ConversationStateDocument,
+} from '../conversation-states/schemas/conversation-state.schema';
 import { TemplatesService } from '../templates/templates.service';
 import { OpenAiService } from './openai.service';
 import { stripHtml } from '../common/utils/html';
@@ -57,7 +60,14 @@ export function isNoReplyAddress(address?: string | null): boolean {
  * Dominios cuyos mails van siempre a "Internos", sin importar el remitente ni
  * el contenido. Se pueden sobrescribir con INTERNAL_SENDER_DOMAINS.
  */
-export const DEFAULT_INTERNAL_SENDER_DOMAINS = ['uber.com', 'hotelplanner.com'];
+export const DEFAULT_INTERNAL_SENDER_DOMAINS = [
+  'uber.com',
+  'hotelplanner.com',
+  // Cubre también discussions.tripleseat.com (la regla incluye subdominios).
+  // Decisión del cliente: TODO tripleseat va a Internos, incluidos los
+  // "New Event Lead" y los hilos humanos de larkhotels.*@discussions.tripleseat.com.
+  'tripleseat.com',
+];
 
 /**
  * Parsea la lista de dominios internos desde la config (separados por coma).
@@ -102,6 +112,122 @@ export function matchInternalSenderRule(
     return { rule: 'dominio', detail: `dominio interno (${from})` };
   }
   return null;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Auto-asignación de hotel
+ *
+ * Una casilla puede servir a varios hoteles, así que la conversación nace con
+ * hotelId null y sin hotel el triage no corre (no hay tono, templates ni
+ * contexto). Estas reglas asignan el hotel SOLO cuando la señal es inequívoca:
+ *
+ *   1. El dominio del remitente es un dominio propio del hotel
+ *      (hello@hotelparian.com → Hotel Parián).
+ *   2. El ASUNTO nombra a exactamente UN hotel de la casilla.
+ *
+ * Se exige match único: si dos hoteles coinciden, no se asigna nada y queda
+ * para el staff. Se matchea solo el asunto (no el cuerpo) porque las firmas y
+ * los pies de mail nombran hoteles que no son el de la conversación.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/** Hotel reducido a lo que necesitan las reglas de match. */
+export interface HotelMatchCandidate {
+  id: string;
+  name: string;
+  matchAliases?: string[];
+  matchDomains?: string[];
+}
+
+export interface HotelMatchResult {
+  hotelId: string;
+  hotelName: string;
+  rule: 'dominio' | 'asunto';
+  detail: string;
+}
+
+/** Minúsculas y sin acentos, para comparar nombres escritos de cualquier forma. */
+function normalizeText(value: string): string {
+  return (value ?? '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '');
+}
+
+/** Términos con los que se busca al hotel en el asunto (fallback: su nombre). */
+export function hotelMatchTerms(hotel: HotelMatchCandidate): string[] {
+  const aliases = (hotel.matchAliases ?? []).map(normalizeText).filter(Boolean);
+  return aliases.length > 0 ? aliases : [normalizeText(hotel.name)].filter(Boolean);
+}
+
+/** True si el término aparece en el texto como palabra completa. */
+function containsTerm(normalizedText: string, term: string): boolean {
+  const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`).test(normalizedText);
+}
+
+/**
+ * Hotel cuyo dominio propio coincide con el del remitente (incluye subdominios).
+ * Devuelve null si no hay match o si matchean varios hoteles.
+ */
+export function matchHotelBySenderDomain(
+  address: string | null | undefined,
+  hotels: HotelMatchCandidate[],
+): HotelMatchResult | null {
+  const domain = normalizeText((address ?? '').trim()).split('@')[1];
+  if (!domain) return null;
+
+  const hits = hotels.filter((h) =>
+    (h.matchDomains ?? [])
+      .map((d) => normalizeText(d).replace(/^@/, ''))
+      .filter(Boolean)
+      .some((d) => domain === d || domain.endsWith(`.${d}`)),
+  );
+
+  if (hits.length !== 1) return null;
+  return {
+    hotelId: hits[0].id,
+    hotelName: hits[0].name,
+    rule: 'dominio',
+    detail: `remitente del dominio propio del hotel (${address?.trim()})`,
+  };
+}
+
+/**
+ * Hotel nombrado en el asunto. Exige match único: un asunto que menciona dos
+ * hoteles ("Hotel Parián & Hotel Dama") no asigna nada.
+ */
+export function matchHotelBySubject(
+  subject: string | null | undefined,
+  hotels: HotelMatchCandidate[],
+): HotelMatchResult | null {
+  const text = normalizeText(subject ?? '');
+  if (!text) return null;
+
+  const hits = hotels.filter((h) => hotelMatchTerms(h).some((t) => containsTerm(text, t)));
+
+  if (hits.length !== 1) return null;
+  const term = hotelMatchTerms(hits[0]).find((t) => containsTerm(text, t));
+  return {
+    hotelId: hits[0].id,
+    hotelName: hits[0].name,
+    rule: 'asunto',
+    detail: `el asunto nombra solo a este hotel ("${term}")`,
+  };
+}
+
+/**
+ * Aplica las reglas de auto-asignación en orden de confianza. Devuelve null si
+ * ninguna es concluyente (queda para asignación manual).
+ */
+export function matchHotelForMessage(
+  message: { fromAddress?: string | null; subject?: string | null },
+  hotels: HotelMatchCandidate[],
+): HotelMatchResult | null {
+  if (hotels.length === 0) return null;
+  return (
+    matchHotelBySenderDomain(message.fromAddress, hotels) ??
+    matchHotelBySubject(message.subject, hotels)
+  );
 }
 
 /**
@@ -152,7 +278,8 @@ export class AiTriageService {
     @InjectModel(Conversation.name) private readonly conversationModel: Model<ConversationDocument>,
     @InjectModel(Message.name) private readonly messageModel: Model<MessageDocument>,
     @InjectModel(Hotel.name) private readonly hotelModel: Model<HotelDocument>,
-    @InjectModel(ConversationState.name) private readonly stateModel: Model<ConversationStateDocument>,
+    @InjectModel(ConversationState.name)
+    private readonly stateModel: Model<ConversationStateDocument>,
     private readonly templatesService: TemplatesService,
     private readonly openAiService: OpenAiService,
     private readonly config: ConfigService,
@@ -182,7 +309,73 @@ export class AiTriageService {
       this.logger.error(`Error en clasificación de internos [conv=${conversationId}]:`, err);
     }
 
+    // Auto-asignación de hotel: sin hotel el triage no puede correr. Si falla,
+    // se sigue igual — la conversación queda para asignación manual.
+    try {
+      await this.assignHotelIfCertain(conversationId, tenantId, messageId);
+    } catch (err) {
+      this.logger.error(`Error en auto-asignación de hotel [conv=${conversationId}]:`, err);
+    }
+
     await this.processInbound(conversationId, tenantId, messageId);
+  }
+
+  /**
+   * Asigna el hotel de la conversación cuando una regla determinística lo
+   * identifica sin ambigüedad (ver `matchHotelForMessage`). Devuelve el match
+   * aplicado, o null si no hubo señal concluyente.
+   *
+   * Solo actúa sobre conversaciones SIN hotel: nunca pisa una asignación previa,
+   * ni humana ni automática. Los candidatos son los hoteles activos de la misma
+   * casilla, la misma restricción que valida la asignación manual.
+   */
+  async assignHotelIfCertain(
+    conversationId: string,
+    tenantId: string,
+    messageId: string,
+  ): Promise<HotelMatchResult | null> {
+    const conversation = await this.conversationModel.findOne({
+      _id: new Types.ObjectId(conversationId),
+      tenantId: new Types.ObjectId(tenantId),
+    });
+    if (!conversation || conversation.hotelId) return null;
+
+    const message = await this.messageModel.findById(messageId);
+    if (!message) return null;
+
+    const hotels = await this.hotelModel.find({
+      tenantId: new Types.ObjectId(tenantId),
+      mailboxId: conversation.mailboxId,
+      active: true,
+    });
+
+    const match = matchHotelForMessage(
+      { fromAddress: message.from?.address, subject: message.subject },
+      hotels.map((h) => ({
+        id: (h._id as Types.ObjectId).toString(),
+        name: h.name,
+        matchAliases: h.matchAliases,
+        matchDomains: h.matchDomains,
+      })),
+    );
+    if (!match) return null;
+
+    await this.conversationModel.updateOne(
+      { _id: conversation._id, hotelId: null },
+      {
+        $set: {
+          hotelId: new Types.ObjectId(match.hotelId),
+          hotelAutoAssigned: true,
+          hotelAssignmentReason: `auto (${match.rule}): ${match.detail}`,
+        },
+      },
+    );
+
+    this.logger.log(
+      `Hotel auto-asignado "${match.hotelName}" por regla "${match.rule}" ` +
+        `[conv=${conversationId}] ${match.detail}`,
+    );
+    return match;
   }
 
   /**
@@ -328,11 +521,7 @@ export class AiTriageService {
    * respuesta sugerida (desde template o generada). Nunca envía el mail.
    * Se llama de forma asíncrona desde el webhook, nunca bloquea el sync.
    */
-  async processInbound(
-    conversationId: string,
-    tenantId: string,
-    messageId: string,
-  ): Promise<void> {
+  async processInbound(conversationId: string, tenantId: string, messageId: string): Promise<void> {
     if (!this.openAiService.isEnabled) return;
 
     try {
@@ -367,7 +556,9 @@ export class AiTriageService {
 
     // Sin hotel asignado no hay contexto para la IA: se procesará al asignarlo manualmente.
     if (!conversation.hotelId) {
-      this.logger.debug(`Triage IA: conversación sin hotel asignado [conv=${conversationId}], se omite`);
+      this.logger.debug(
+        `Triage IA: conversación sin hotel asignado [conv=${conversationId}], se omite`,
+      );
       return;
     }
 
@@ -412,9 +603,10 @@ export class AiTriageService {
     }
 
     // --- 7. Mapear stateName -> stateId ---
-    let targetState = states.find(
-      (s) => s.name.toLowerCase() === result.stateName.toLowerCase(),
-    ) ?? states.find((s) => s.isDefault) ?? states[0];
+    let targetState =
+      states.find((s) => s.name.toLowerCase() === result.stateName.toLowerCase()) ??
+      states.find((s) => s.isDefault) ??
+      states[0];
 
     if (!targetState) {
       this.logger.warn(`Triage IA: no se pudo mapear estado "${result.stateName}"`);
@@ -435,7 +627,9 @@ export class AiTriageService {
     // --- 8. Resolver templateId si aplica ---
     let resolvedTemplateId: Types.ObjectId | null = null;
     if (result.source === 'template' && result.templateId) {
-      const matchedTemplate = templates.find((t) => (t._id as Types.ObjectId).toString() === result.templateId);
+      const matchedTemplate = templates.find(
+        (t) => (t._id as Types.ObjectId).toString() === result.templateId,
+      );
       if (matchedTemplate) resolvedTemplateId = matchedTemplate._id as Types.ObjectId;
     }
 
@@ -472,10 +666,7 @@ export class AiTriageService {
     }
   }
 
-  private async _doPrepareFollowupDraft(
-    conversationId: string,
-    tenantId: string,
-  ): Promise<void> {
+  private async _doPrepareFollowupDraft(conversationId: string, tenantId: string): Promise<void> {
     const conversation = await this.conversationModel.findOne({
       _id: new Types.ObjectId(conversationId),
       tenantId: new Types.ObjectId(tenantId),
@@ -496,12 +687,7 @@ export class AiTriageService {
     const hotelId = conversation.hotelId.toString();
     const followupTags = ['seguimiento', 'follow-up', 'followup', 'follow_up'];
 
-    let templates = await this.templatesService.findByTags(
-      tenantId,
-      hotelId,
-      followupTags,
-      5,
-    );
+    let templates = await this.templatesService.findByTags(tenantId, hotelId, followupTags, 5);
 
     // Fallback: búsqueda por texto si no hay tags explícitos
     if (templates.length === 0) {
@@ -599,9 +785,7 @@ export class AiTriageService {
 
   private _applySimpleFollowupVars(body: string, contactName: string): string {
     if (!contactName) return body;
-    return body
-      .replace(/\[NOMBRE\]/gi, contactName)
-      .replace(/\[NAME\]/gi, contactName);
+    return body.replace(/\[NOMBRE\]/gi, contactName).replace(/\[NAME\]/gi, contactName);
   }
 
   private _buildFollowupSystemPrompt(hotel: HotelDocument): string {

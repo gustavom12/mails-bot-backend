@@ -273,6 +273,9 @@ export class ConversationsService {
     }
 
     conversation.hotelId = hotel._id as Types.ObjectId;
+    // Asignación humana: pisa cualquier marca de la regla automática.
+    conversation.hotelAutoAssigned = false;
+    conversation.hotelAssignmentReason = null;
     await conversation.save();
 
     return this.findOne(tenantId, conversationId);

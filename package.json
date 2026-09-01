@@ -23,6 +23,10 @@
     "webhooks:register": "ts-node -r tsconfig-paths/register src/scripts/register-webhooks.ts",
     "internals:check": "ts-node -r tsconfig-paths/register src/scripts/check-internals.ts",
     "webhooks:list": "ts-node -r tsconfig-paths/register src/scripts/list-webhooks.ts",
+    "hotel:delete": "ts-node -r tsconfig-paths/register src/scripts/delete-hotel.ts",
+    "hotels:backfill-matching": "ts-node -r tsconfig-paths/register src/scripts/backfill-hotel-matching.ts",
+    "hotels:check-match": "ts-node -r tsconfig-paths/register src/scripts/check-hotel-match.ts",
+    "conversations:resync-state": "ts-node -r tsconfig-paths/register src/scripts/resync-conversation-states.ts",
     "tunnel": "bash scripts/dev-tunnel.sh"
   },
   "dependencies": {

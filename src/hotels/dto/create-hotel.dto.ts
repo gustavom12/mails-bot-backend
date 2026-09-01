@@ -7,6 +7,9 @@ export const CreateHotelSchema = z.object({
   signature: z.string().trim().optional().default(''),
   brandInfo: z.string().trim().optional().default(''),
   aiRules: z.array(z.string().trim()).optional().default([]),
+  // Auto-asignación de hotel: términos a buscar en el asunto y dominios propios.
+  matchAliases: z.array(z.string().trim().min(3)).optional().default([]),
+  matchDomains: z.array(z.string().trim().toLowerCase()).optional().default([]),
 });
 
 export type CreateHotelDto = z.infer<typeof CreateHotelSchema>;

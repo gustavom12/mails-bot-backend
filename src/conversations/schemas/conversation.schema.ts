@@ -24,6 +24,15 @@ export class Conversation {
   @Prop({ type: Types.ObjectId, ref: 'Hotel', default: null })
   declare hotelId: Types.ObjectId | null;
 
+  // true = el hotel lo puso una regla automática, no una persona. Sirve para
+  // distinguir en la UI una asignación por regla de una decisión del staff.
+  @Prop({ type: Boolean, default: false })
+  declare hotelAutoAssigned: boolean;
+
+  // Regla que asignó el hotel, para auditar por qué quedó donde quedó.
+  @Prop({ type: String, default: null })
+  declare hotelAssignmentReason: string | null;
+
   @Prop({ required: true, type: Types.ObjectId, ref: 'ConversationState' })
   declare stateId: Types.ObjectId;
 

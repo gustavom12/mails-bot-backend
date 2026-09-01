@@ -7,6 +7,8 @@ export const UpdateHotelSchema = z.object({
   signature: z.string().trim().optional(),
   brandInfo: z.string().trim().optional(),
   aiRules: z.array(z.string().trim()).optional(),
+  matchAliases: z.array(z.string().trim().min(3)).optional(),
+  matchDomains: z.array(z.string().trim().toLowerCase()).optional(),
   active: z.boolean().optional(),
 });
 

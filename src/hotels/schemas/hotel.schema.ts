@@ -28,6 +28,17 @@ export class Hotel {
   @Prop({ type: [String], default: [] })
   declare aiRules: string[];
 
+  // Términos con los que se reconoce al hotel en el ASUNTO de un mail entrante
+  // (ej: ["Hotel Parián", "Parián"]). Se usan para la auto-asignación de hotel.
+  // Vacío = se usa el nombre del hotel como único término.
+  @Prop({ type: [String], default: [] })
+  declare matchAliases: string[];
+
+  // Dominios de correo propios del hotel (ej: ["hotelparian.com"]). Un mail
+  // entrante desde esos dominios se asigna a este hotel. Incluye subdominios.
+  @Prop({ type: [String], default: [] })
+  declare matchDomains: string[];
+
   @Prop({ default: true })
   declare active: boolean;
 }
