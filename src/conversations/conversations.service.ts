@@ -9,6 +9,7 @@ import { Hotel, HotelDocument } from '../hotels/schemas/hotel.schema';
 import { AurinkoService } from '../aurinko/aurinko.service';
 import { EncryptionService } from '../common/crypto/encryption.service';
 import { ConversationStatesService } from '../conversation-states/conversation-states.service';
+import { extractInlineImages } from '../common/utils/inline-images';
 
 export interface ConversationFilters {
   mailboxId?: string;
@@ -778,6 +779,46 @@ export class ConversationsService {
       .exec();
   }
 
+  /**
+   * Agrega la firma del hotel al final del cuerpo.
+   *
+   * Vive en el backend a propósito: cuando la precargaba el compositor, si los
+   * hoteles todavía no habían terminado de cargar el editor quedaba vacío y el mail
+   * salía sin firma.
+   */
+  private async appendHotelSignature(
+    tenantId: string,
+    hotelId: Types.ObjectId | null,
+    body: string,
+  ): Promise<string> {
+    if (!hotelId) return body;
+
+    const hotel = await this.hotelModel
+      .findOne({ _id: hotelId, tenantId: new Types.ObjectId(tenantId) })
+      .select('signature')
+      .lean()
+      .exec();
+
+    const signature = hotel?.signature?.trim();
+    if (!signature) return body;
+    if (this.bodyHasSignature(body, signature)) return body;
+
+    return `${body}<br><br>${signature}`;
+  }
+
+  /**
+   * Detecta si el cuerpo ya trae la firma, para no duplicarla mientras convivan
+   * versiones del front que la siguen precargando en el compositor.
+   */
+  private bodyHasSignature(body: string, signature: string): boolean {
+    if (body.includes(signature)) return true;
+
+    // La firma suele ser una imagen embebida: comparar un tramo del base64 aguanta
+    // las normalizaciones de HTML que hace el editor.
+    const fingerprint = /base64,\s*([A-Za-z0-9+/=]{64})/.exec(signature)?.[1];
+    return fingerprint ? body.includes(fingerprint) : false;
+  }
+
   async sendReply(
     tenantId: string,
     conversationId: string,
@@ -809,27 +850,42 @@ export class ConversationsService {
       ? conversation.subject
       : `Re: ${conversation.subject}`;
 
+    // La firma se agrega acá y no en el compositor: así no depende de que el front
+    // la haya precargado antes de que terminaran de cargar los hoteles.
+    const finalBody = await this.appendHotelSignature(tenantId, conversation.hotelId, body);
+
+    // Las imágenes embebidas (la firma, sobre todo) viajan como adjunto inline con
+    // Content-ID — Gmail y Outlook descartan las imágenes `data:` que reciben.
+    const { html: bodyToSend, images: inlineImages } = extractInlineImages(finalBody);
+
+    const outgoingAttachments = [
+      ...(attachments ?? []).map((a) => ({
+        name: a.name,
+        mimeType: a.mimeType,
+        content: a.content,
+      })),
+      ...inlineImages,
+    ];
+
     const result = await this.aurinkoService.sendEmail(token, {
       subject,
-      body,
+      body: bodyToSend,
       to: [{ address: conversation.contactEmail, name: conversation.contactName ?? undefined }],
       ...(cc?.length ? { cc } : {}),
-      ...(attachments?.length
-        ? {
-            attachments: attachments.map((a) => ({
-              name: a.name,
-              mimeType: a.mimeType,
-              content: a.content,
-            })),
-          }
-        : {}),
+      ...(outgoingAttachments.length ? { attachments: outgoingAttachments } : {}),
     });
 
     // Aurinko may not always return an id — generate a stable fallback
     const messageId = result.id || `sent-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
-    // Persist the outbound message immediately so it appears in the thread
-    const bodyPreview = body.replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').trim().slice(0, 300);
+    // Persist the outbound message immediately so it appears in the thread.
+    // Se guarda `finalBody` (con el data URI) y no la versión con `cid:`: los
+    // adjuntos inline no quedan en la base, así que en la bandeja se vería rota.
+    const bodyPreview = finalBody
+      .replace(/<[^>]+>/g, '')
+      .replace(/&nbsp;/g, ' ')
+      .trim()
+      .slice(0, 300);
     await this.messageModel.create({
       tenantId: new Types.ObjectId(tenantId),
       conversationId: new Types.ObjectId(conversationId),
@@ -840,7 +896,7 @@ export class ConversationsService {
       from: { address: mailbox.email, name: mailbox.email },
       toRecipients: [{ address: conversation.contactEmail, name: conversation.contactName ?? '' }],
       ccRecipients: cc?.map((c) => ({ address: c.address, name: c.name ?? '' })) ?? [],
-      bodyHtml: body,
+      bodyHtml: finalBody,
       bodyPreview,
       direction: 'outbound' as const,
       receivedAt: new Date(),
