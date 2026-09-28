@@ -780,7 +780,8 @@ export class ConversationsService {
   }
 
   /**
-   * Agrega la firma del hotel al final del cuerpo.
+   * Agrega la firma al final del cuerpo (la del hotel, o la de la casilla si la
+   * conversación no tiene hotel asignado — ver `resolveSignature`).
    *
    * Vive en el backend a propósito: cuando la precargaba el compositor, si los
    * hoteles todavía no habían terminado de cargar el editor quedaba vacío y el mail
@@ -789,21 +790,58 @@ export class ConversationsService {
   private async appendHotelSignature(
     tenantId: string,
     hotelId: Types.ObjectId | null,
+    mailboxId: Types.ObjectId,
     body: string,
   ): Promise<string> {
-    if (!hotelId) return body;
-
-    const hotel = await this.hotelModel
-      .findOne({ _id: hotelId, tenantId: new Types.ObjectId(tenantId) })
-      .select('signature')
-      .lean()
-      .exec();
-
-    const signature = hotel?.signature?.trim();
+    const signature = await this.resolveSignature(tenantId, hotelId, mailboxId);
     if (!signature) return body;
     if (this.bodyHasSignature(body, signature)) return body;
 
     return `${body}<br><br>${signature}`;
+  }
+
+  /**
+   * Firma que le corresponde a la respuesta: la del hotel de la conversación y,
+   * cuando no tiene hotel asignado, la de la casilla.
+   *
+   * El fallback por casilla existe porque la auto-asignación de hotel cubre solo
+   * una parte de las conversaciones (dominio del remitente o nombre en el asunto)
+   * y todas las demás salían sin firma. Se usa únicamente si **todos** los hoteles
+   * activos de la casilla comparten exactamente la misma firma — el caso de una
+   * marca de colección, donde la firma no distingue hotel. Si difieren no hay
+   * forma de saber cuál va, y es preferible no firmar antes que firmar con la
+   * marca equivocada.
+   */
+  private async resolveSignature(
+    tenantId: string,
+    hotelId: Types.ObjectId | null,
+    mailboxId: Types.ObjectId,
+  ): Promise<string | null> {
+    const tenant = new Types.ObjectId(tenantId);
+
+    if (hotelId) {
+      const hotel = await this.hotelModel
+        .findOne({ _id: hotelId, tenantId: tenant })
+        .select('signature')
+        .lean()
+        .exec();
+
+      return hotel?.signature?.trim() || null;
+    }
+
+    const hotels = await this.hotelModel
+      .find({ tenantId: tenant, mailboxId, active: true })
+      .select('signature')
+      .lean()
+      .exec();
+    if (hotels.length === 0) return null;
+
+    const signatures = new Set(hotels.map((h) => h.signature?.trim() ?? ''));
+    if (signatures.size !== 1) return null;
+
+    // Un único valor compartido: puede ser la firma de la colección o vacío.
+    const [shared] = [...signatures];
+    return shared || null;
   }
 
   /**
@@ -852,7 +890,12 @@ export class ConversationsService {
 
     // La firma se agrega acá y no en el compositor: así no depende de que el front
     // la haya precargado antes de que terminaran de cargar los hoteles.
-    const finalBody = await this.appendHotelSignature(tenantId, conversation.hotelId, body);
+    const finalBody = await this.appendHotelSignature(
+      tenantId,
+      conversation.hotelId,
+      conversation.mailboxId,
+      body,
+    );
 
     // Las imágenes embebidas (la firma, sobre todo) viajan como adjunto inline con
     // Content-ID — Gmail y Outlook descartan las imágenes `data:` que reciben.
