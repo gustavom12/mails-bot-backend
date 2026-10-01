@@ -27,6 +27,7 @@
     "hotels:backfill-matching": "ts-node -r tsconfig-paths/register src/scripts/backfill-hotel-matching.ts",
     "hotels:check-match": "ts-node -r tsconfig-paths/register src/scripts/check-hotel-match.ts",
     "conversations:resync-state": "ts-node -r tsconfig-paths/register src/scripts/resync-conversation-states.ts",
+    "conversations:restore-closed": "ts-node -r tsconfig-paths/register src/scripts/restore-closed-conversations.ts",
     "tunnel": "bash scripts/dev-tunnel.sh"
   },
   "dependencies": {

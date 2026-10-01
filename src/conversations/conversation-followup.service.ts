@@ -71,9 +71,16 @@ export class ConversationFollowupService {
       }
     }
 
-    // Buscar conversaciones cuyo lastActivityAt superó el umbral de inactividad
+    // Los estados cerrados ("Cerrado", "Internos") son decisiones terminales: una
+    // conversación cerrada ya no espera respuesta del cliente. Sin este filtro, la
+    // que alguien cerraba a mano volvía sola a "Requiere atención" en la corrida
+    // siguiente, porque su último mensaje seguía siendo saliente y viejo.
+    const closedStates = await this.stateModel.find({ isClosed: true }).select('_id').lean().exec();
+    const closedStateIds = closedStates.map((s) => s._id);
+
+    // Buscar conversaciones abiertas cuyo lastActivityAt superó el umbral de inactividad
     const candidates = await this.conversationModel
-      .find({ lastActivityAt: { $lt: cutoff } })
+      .find({ lastActivityAt: { $lt: cutoff }, stateId: { $nin: closedStateIds } })
       .select('_id tenantId hotelId stateId lastActivityAt')
       .lean()
       .exec();
