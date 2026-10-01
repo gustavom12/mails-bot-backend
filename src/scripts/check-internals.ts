@@ -4,9 +4,9 @@
  * Corre el MISMO proceso de clasificación que usa el webhook sobre
  * conversaciones existentes, filtradas por CLI, y muestra si cada una iría a
  * "Internos" o al flujo normal:
- *   1. Remitentes no-reply (noreply@, no-reply@, do-not-reply@…) y dominios de
- *      INTERNAL_SENDER_DOMAINS → "Internos" por regla determinística, sin
- *      consultar a la IA.
+ *   1. Remitentes no-reply (noreply@, no-reply@, do-not-reply@…), dominios de
+ *      INTERNAL_SENDER_DOMAINS y avisos automáticos de calendario → "Internos"
+ *      por regla determinística, sin consultar a la IA.
  *   2. El resto → mismos prompts, modelo y umbral de confianza que producción.
  *
  * Por defecto es un DRY-RUN: no modifica nada. Con --apply mueve efectivamente
@@ -24,8 +24,9 @@
  *   --contact <texto>    contactEmail contiene el texto (case-insensitive)
  *   --subject <texto>    asunto contiene el texto (case-insensitive)
  *   --limit <n>          máximo de conversaciones a evaluar (default: 20)
- *   --no-ai              solo aplica las reglas determinísticas (no-reply y
- *                        dominios internos); no usa la IA ni consume tokens.
+ *   --no-ai              solo aplica las reglas determinísticas (no-reply,
+ *                        dominios internos y calendario); no usa la IA ni
+ *                        consume tokens.
  *                        Alias: --noreply-only
  *   --apply              aplica los cambios (default: solo mostrar)
  *
@@ -35,8 +36,9 @@
  *   npm run internals:check -- --tenant 6a6bf9b2f89d1d90ed0a2aba --no-ai --limit 500 --apply
  *
  * Variables de entorno: MONGODB_URI, OPENAI_API_KEY, OPENAI_MODEL,
- * INTERNAL_STATE_NAME (default "Internos"), INTERNAL_MIN_CONFIDENCE (default 0.95),
- * INTERNAL_SENDER_DOMAINS (default "uber.com,hotelplanner.com").
+ * INTERNAL_STATE_NAME (default "Internos"), INTERNAL_MIN_CONFIDENCE e
+ * INTERNAL_SENDER_DOMAINS (defaults: los mismos que usa el triage, ver
+ * DEFAULT_INTERNAL_MIN_CONFIDENCE y DEFAULT_INTERNAL_SENDER_DOMAINS).
  */
 import * as mongoose from 'mongoose';
 import * as dotenv from 'dotenv';
@@ -45,7 +47,8 @@ import OpenAI from 'openai';
 import {
   buildInternalCheckSystemPrompt,
   buildInternalCheckUserPrompt,
-  matchInternalSenderRule,
+  DEFAULT_INTERNAL_MIN_CONFIDENCE,
+  matchInternalRule,
   messagePlainText,
   parseInternalSenderDomains,
   InternalCheckResult,
@@ -56,7 +59,9 @@ dotenv.config({ path: path.resolve(__dirname, '../../.env') });
 const MONGODB_URI = process.env.MONGODB_URI ?? 'mongodb://localhost:27017/mails-bot';
 const OPENAI_MODEL = process.env.OPENAI_MODEL ?? 'gpt-4o';
 const INTERNAL_STATE_NAME = process.env.INTERNAL_STATE_NAME ?? 'Internos';
-const MIN_CONFIDENCE = Number(process.env.INTERNAL_MIN_CONFIDENCE ?? '0.95');
+const MIN_CONFIDENCE = Number(
+  process.env.INTERNAL_MIN_CONFIDENCE ?? DEFAULT_INTERNAL_MIN_CONFIDENCE,
+);
 const INTERNAL_SENDER_DOMAINS = parseInternalSenderDomains(process.env.INTERNAL_SENDER_DOMAINS);
 
 // ─── Parseo de argumentos ────────────────────────────────────────────────────
@@ -230,8 +235,11 @@ async function run() {
     }
     const msg = lastInbound[0];
 
-    // Reglas determinísticas (no-reply / dominio interno): sin llamar a la IA.
-    const senderRule = matchInternalSenderRule(msg.from?.address, INTERNAL_SENDER_DOMAINS);
+    // Reglas determinísticas (no-reply / dominio interno / calendario): sin llamar a la IA.
+    const senderRule = matchInternalRule(
+      { fromAddress: msg.from?.address, subject: msg.subject, attachments: msg.attachments },
+      INTERNAL_SENDER_DOMAINS,
+    );
     if (senderRule) {
       toInternal++;
       console.log(`🟣 → INTERNOS  ${label}\n      regla ${senderRule.rule}: ${senderRule.detail}`);

@@ -67,7 +67,23 @@ export const DEFAULT_INTERNAL_SENDER_DOMAINS = [
   // Decisión del cliente: TODO tripleseat va a Internos, incluidos los
   // "New Event Lead" y los hilos humanos de larkhotels.*@discussions.tripleseat.com.
   'tripleseat.com',
+  // Avisos automáticos del banco (transferencias, depósitos, compras, promos,
+  // encuestas). Se listan los subdominios de envío y no "santander.com.mx" a
+  // propósito: así un mail escrito por una persona del banco
+  // (nombre@santander.com.mx) no se archiva.
+  'calidad.santander.com.mx',
+  'envio.santander.com.mx',
+  'envios.santander.com.mx',
+  'notificaciones.santander.com.mx',
+  'operaciones.santander.com.mx',
 ];
+
+/**
+ * Confianza mínima que tiene que declarar la IA para archivar un mail como interno.
+ * gpt-4o contesta 0.9 en los casos que da por seguros y casi nunca más: con el
+ * umbral anterior (0.95) el clasificador prácticamente no archivaba nada.
+ */
+export const DEFAULT_INTERNAL_MIN_CONFIDENCE = 0.9;
 
 /**
  * Parsea la lista de dominios internos desde la config (separados por coma).
@@ -110,6 +126,61 @@ export function matchInternalSenderRule(
   }
   if (isInternalSenderDomain(address, domains)) {
     return { rule: 'dominio', detail: `dominio interno (${from})` };
+  }
+  return null;
+}
+
+/** Lo que miran las reglas determinísticas de "Internos". */
+export interface InternalRuleInput {
+  fromAddress?: string | null;
+  subject?: string | null;
+  attachments?: { name?: string | null; contentType?: string | null }[] | null;
+}
+
+/**
+ * Prefijos que Google Calendar y Outlook le ponen al asunto de sus avisos
+ * (invitación, actualización, cancelación y respuestas de los invitados), en
+ * inglés y en español. Se comparan sobre el asunto ya normalizado (sin acentos).
+ */
+const CALENDAR_SUBJECT_PREFIX = new RegExp(
+  '^\\s*(?:' +
+    '(?:synced |updated )?invitation|invitacion(?: sincronizada| actualizada)?|' +
+    'canceled event|evento cancelado|' +
+    'accepted|declined|tentatively accepted|aceptad[ao]|rechazad[ao]' +
+    ')(?: with note| con (?:una )?nota)?\\s*:',
+);
+
+/**
+ * Avisos automáticos de calendario. Los genera el calendario, no una persona, y
+ * el evento ya queda agendado en la cuenta: en el tablero solo hacen ruido.
+ *
+ * Se exigen las DOS señales — el prefijo del calendario al inicio del asunto y
+ * el adjunto .ics — para no archivar un mail escrito por alguien que menciona
+ * una invitación, ni un "Re:"/"Fwd:" de una invitación con comentarios.
+ */
+export function isCalendarNotification(message: InternalRuleInput): boolean {
+  if (!CALENDAR_SUBJECT_PREFIX.test(normalizeText(message.subject ?? ''))) return false;
+
+  return (message.attachments ?? []).some(
+    (a) => /\.ics$/i.test((a.name ?? '').trim()) || /calendar|\/ics\b/i.test(a.contentType ?? ''),
+  );
+}
+
+/**
+ * Todas las reglas determinísticas de "Internos", en orden: remitente (no-reply
+ * y dominios internos) y avisos de calendario. Devuelve null si el mail tiene
+ * que seguir al clasificador de IA.
+ */
+export function matchInternalRule(
+  message: InternalRuleInput,
+  domains: string[],
+): { rule: string; detail: string } | null {
+  const senderRule = matchInternalSenderRule(message.fromAddress, domains);
+  if (senderRule) return senderRule;
+
+  if (isCalendarNotification(message)) {
+    const subject = (message.subject ?? '').trim().slice(0, 60);
+    return { rule: 'calendario', detail: `aviso automático de calendario ("${subject}")` };
   }
   return null;
 }
@@ -387,7 +458,8 @@ export class AiTriageService {
    * - Remitentes no-reply (noreply@, no-reply@, do-not-reply@…) y dominios de
    *   INTERNAL_SENDER_DOMAINS: reglas determinísticas, se cortan antes de la IA
    *   (no gastan tokens) y aplican tanto a conversaciones nuevas como a hilos
-   *   que ya tenían mensajes.
+   *   que ya tenían mensajes. Lo mismo los avisos automáticos de calendario
+   *   (ver `isCalendarNotification`).
    * - El resto se clasifica con IA SOLO en conversaciones nuevas y solo si está
    *   totalmente segura: un hilo con historial humano nunca se archiva solo.
    *   Los mensajes siguientes de un hilo ya interno se mantienen leídos y en la
@@ -425,25 +497,29 @@ export class AiTriageService {
     const message = await this.messageModel.findById(messageId);
     if (!message) return false;
 
-    // Reglas determinísticas (remitente no-reply o dominio interno): van a
-    // "Internos" sin llamar a la IA — se cortan antes para no gastar tokens.
-    // Solo se respeta la decisión de un humano que la movió a mano.
-    const senderRule = matchInternalSenderRule(
-      message.from?.address,
+    // Reglas determinísticas (remitente no-reply, dominio interno o aviso de
+    // calendario): van a "Internos" sin llamar a la IA — se cortan antes para no
+    // gastar tokens. Solo se respeta la decisión de un humano que la movió a mano.
+    const rule = matchInternalRule(
+      {
+        fromAddress: message.from?.address,
+        subject: message.subject,
+        attachments: message.attachments,
+      },
       parseInternalSenderDomains(this.config.get<string>('INTERNAL_SENDER_DOMAINS')),
     );
 
-    if (senderRule) {
+    if (rule) {
       if (this._movedByHuman(conversation)) return false;
 
       await this._moveToInternal(conversation, internalState, {
-        summary: `Interno (${senderRule.rule}): ${senderRule.detail}`,
-        note: `auto: ${senderRule.detail}`,
+        summary: `Interno (${rule.rule}): ${rule.detail}`,
+        note: `auto: ${rule.detail}`,
       });
 
       this.logger.log(
-        `Mail interno por regla "${senderRule.rule}" → "${internalState.name}" ` +
-          `[conv=${conversationId}] ${senderRule.detail}`,
+        `Mail interno por regla "${rule.rule}" → "${internalState.name}" ` +
+          `[conv=${conversationId}] ${rule.detail}`,
       );
       return true;
     }
@@ -461,7 +537,9 @@ export class AiTriageService {
       }),
     );
 
-    const minConfidence = Number(this.config.get<string>('INTERNAL_MIN_CONFIDENCE') ?? '0.95');
+    const minConfidence = Number(
+      this.config.get<string>('INTERNAL_MIN_CONFIDENCE') ?? DEFAULT_INTERNAL_MIN_CONFIDENCE,
+    );
     if (
       !result ||
       result.internal !== true ||
